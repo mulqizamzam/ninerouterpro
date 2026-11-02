@@ -240,6 +240,44 @@ function isMessagesModel(model) {
   return MESSAGES_MODELS.has(baseModelId(model));
 }
 
+const conversationSessions = new Map();
+const MAX_CONVERSATION_SESSIONS = 1000;
+
+function conversationSessionId(key) {
+  const existing = conversationSessions.get(key);
+  if (existing) {
+    existing.lastUsed = Date.now();
+    return existing.sessionId;
+  }
+  if (conversationSessions.size >= MAX_CONVERSATION_SESSIONS) {
+    conversationSessions.delete(conversationSessions.keys().next().value);
+  }
+  const sessionId = generateSessionId();
+  conversationSessions.set(key, { sessionId, lastUsed: Date.now() });
+  return sessionId;
+}
+
+function extractFirstMessageContent(body) {
+  try {
+    const items = Array.isArray(body?.messages) ? body.messages : (Array.isArray(body?.input) ? body.input : null);
+    if (!items || items.length === 0) return "";
+    const first = items[0];
+    if (!first) return "";
+    if (typeof first.content === "string") return first.content.slice(0, 500);
+    if (Array.isArray(first.content)) {
+      let text = "";
+      for (const part of first.content) {
+        text += part?.text || part?.input_text || part?.output || "";
+        if (text.length >= 500) break;
+      }
+      return text.slice(0, 500);
+    }
+  } catch {
+    return "";
+  }
+  return "";
+}
+
 function resolveOpencodeSession(body, credentials, providerSessionId, clientTool) {
   const headers = credentials?.rawHeaders || {};
   const native = nativeSession(headers);
@@ -255,6 +293,21 @@ function resolveOpencodeSession(body, credentials, providerSessionId, clientTool
 
   const hinted = incoming || normalizeSession(providerSessionId);
   if (hinted) return translateSessionId(hinted, clientTool);
+
+  const explicitClient = body?.prompt_cache_key || body?.session_id || body?.conversation_id;
+  if (explicitClient) {
+    return translateSessionId(String(explicitClient), clientTool);
+  }
+
+  // Multi-turn conversation tracking: anchor on the first prompt of the conversation
+  // so turn 1 (user only) and turn 2+ (user + assistant) stay on the exact same session.
+  const firstPrompt = extractFirstMessageContent(body);
+  if (firstPrompt) {
+    const auth = credentials?.rawHeaders?.authorization || "";
+    const connectionId = credentials?.connectionId || "";
+    const convKey = `${connectionId}:${auth}:${crypto.createHash("sha256").update(firstPrompt).digest("hex")}`;
+    return conversationSessionId(convKey);
+  }
 
   if (credentials?.connectionId || bodyHasSessionHints(body)) {
     let viaManager = null;
@@ -440,15 +493,30 @@ export class OpenCodeExecutor extends BaseExecutor {
   // the free lane.
   async execute(args) {
     const credentials = this.prepareRequestCredentials(args);
+    let providerOverrides = args?.providerOverrides;
+    if (providerOverrides?.headers) {
+      const sanitized = {};
+      for (const [k, v] of Object.entries(providerOverrides.headers)) {
+        if (k.toLowerCase() !== "x-opencode-request") {
+          sanitized[k] = v;
+        }
+      }
+      providerOverrides = { ...providerOverrides, headers: sanitized };
+    }
     return super.execute({
       ...args,
+      providerOverrides,
       credentials,
       // Pro divergence kept: fail open to native fetch when wreq-js is missing.
       directFetch: async (url, options, extra = {}) => {
+        const headers = {
+          ...(options?.headers || {}),
+          "x-opencode-request": generateRequestId(),
+        };
         try {
           return await opencodeTlsFetch(url, {
             method: options.method,
-            headers: options.headers,
+            headers,
             body: options.body,
           }, {
             signal: options.signal,
@@ -456,7 +524,7 @@ export class OpenCodeExecutor extends BaseExecutor {
           });
         } catch (err) {
           if (err?.name !== "OpencodeTlsUnavailableError") throw err;
-          return fetch(url, options);
+          return fetch(url, { ...options, headers });
         }
       },
       directFetchProxy: true,
