@@ -2,7 +2,7 @@
  * OAuth Configuration Constants — static data lives in registry, re-exported here for consumers.
  */
 import { platform, arch } from "os";
-import { ANTIGRAVITY_OAUTH_CLIENT, GOOGLE_OAUTH_CLIENT } from "open-sse/providers/shared.js";
+import { ANTIGRAVITY_OAUTH_CLIENT, GOOGLE_OAUTH_CLIENT, WINDSURF_FIREBASE_API_KEY } from "open-sse/providers/shared.js";
 import { PROVIDER_OAUTH, PROVIDERS as REGISTRY_PROVIDERS } from "open-sse/providers/index.js";
 
 /**
@@ -199,7 +199,7 @@ export const WINDSURF_CONFIG = {
   planStatusPath: "/exa.seat_management_pb.SeatManagementService/GetPlanStatus",
   userStatusPath: "/exa.seat_management_pb.SeatManagementService/GetUserStatus",
   defaultApiServerUrl: "https://server.codeium.com",
-  firebaseApiKey: "AIzaSyDsOl-1XpT5err0Tcn0TFFod1H8gVGIycY",
+  firebaseApiKey: WINDSURF_FIREBASE_API_KEY,
   callbackPath: "/windsurf-auth-callback",
   userAgent: "antigravity-cockpit-tools",
   oauthTimeoutMs: 600_000,

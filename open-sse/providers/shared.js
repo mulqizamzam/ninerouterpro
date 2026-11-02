@@ -96,14 +96,22 @@ export const ANTIGRAVITY_IDE_VERSION = "2.24.0";
 export const ANTIGRAVITY_IDE_BASE_URL = "https://daily-cloudcode-pa.googleapis.com";
 export const ANTIGRAVITY_IDE_USER_AGENT = `antigravity/hub/${ANTIGRAVITY_IDE_VERSION} darwin/arm64`;
 
-// Antigravity OAuth client credentials (public CLI client — duplicated in usage.js + src/lib/oauth)
+// OAuth client credentials come from the environment. Never hardcode them:
+// a client secret in a tracked file is published the moment the repo is pushed.
+// Required vars are documented in .env.example.
+const envValue = (key) => (typeof process !== "undefined" && process.env && process.env[key]) || "";
+
+// Antigravity OAuth client (Google Cloud project for the Antigravity IDE)
 export const ANTIGRAVITY_OAUTH_CLIENT = {
-  clientId: "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com",
-  clientSecret: "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"
+  clientId: envValue("ANTIGRAVITY_OAUTH_CLIENT_ID"),
+  clientSecret: envValue("ANTIGRAVITY_OAUTH_CLIENT_SECRET")
 };
 
-// Gemini (Google) OAuth client credentials (public CLI client — shared by gemini, gemini-cli, src/lib/oauth)
+// Gemini (Google) OAuth client, shared by gemini, gemini-cli and src/lib/oauth
 export const GOOGLE_OAUTH_CLIENT = {
-  clientId: "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com",
-  clientSecret: "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"
+  clientId: envValue("GOOGLE_OAUTH_CLIENT_ID"),
+  clientSecret: envValue("GOOGLE_OAUTH_CLIENT_SECRET")
 };
+
+// Windsurf Firebase web API key (Firebase+Codeium auth chain)
+export const WINDSURF_FIREBASE_API_KEY = envValue("WINDSURF_FIREBASE_API_KEY");
