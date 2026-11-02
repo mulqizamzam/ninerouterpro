@@ -183,16 +183,16 @@ describe("OpenCode Free User-Agent Validation", () => {
   it("defaults User-Agent to the current CLI form for non-opencode downstream clients", () => {
     const executor = getExecutor("opencode");
     const headersNoUa = executor.buildHeaders({});
-    expect(headersNoUa["User-Agent"]).toBe("opencode/1.19.4 ai-sdk/provider-utils/4.0.23 runtime/bun/1.4.4");
+    expect(headersNoUa["User-Agent"]).toBe("opencode/dev/0.0.0-dev-202610272228/opencode");
 
     const headersClaude = executor.buildHeaders({ rawHeaders: { "user-agent": "Claude-Code/1.0" } });
-    expect(headersClaude["User-Agent"]).toBe("opencode/1.19.4 ai-sdk/provider-utils/4.0.23 runtime/bun/1.4.4");
+    expect(headersClaude["User-Agent"]).toBe("opencode/dev/0.0.0-dev-202610272228/opencode");
   });
 
   it("replaces stale opencode User-Agents, which upstream now rejects with 403", () => {
     const executor = getExecutor("opencode");
-    for (const ua of ["opencode", "opencode/1.15.0", "opencode/latest/2.0.26/cli", "opencode/latest/2.0.29/desktop"]) {
-      expect(executor.buildHeaders({ rawHeaders: { "user-agent": ua } })["User-Agent"]).toBe("opencode/1.19.4 ai-sdk/provider-utils/4.0.23 runtime/bun/1.4.4");
+    for (const ua of ["opencode", "opencode/1.15.0", "opencode/1.18.31 ai-sdk/provider-utils/4.0.40 runtime/bun/1.3.14"]) {
+      expect(executor.buildHeaders({ rawHeaders: { "user-agent": ua } })["User-Agent"]).toBe("opencode/dev/0.0.0-dev-202610272228/opencode");
     }
   });
 
@@ -202,16 +202,17 @@ describe("OpenCode Free User-Agent Validation", () => {
     expect(headers["User-Agent"]).toBe("opencode/1.19.4 ai-sdk/provider-utils/4.0.23 runtime/bun/1.4.4");
   });
 
-  it("sends the current CLI headers including x-opencode-request and session id", () => {
+  it("sends the v2 session headers and per-request request ID", () => {
     const executor = getExecutor("opencode");
     const headers = executor.buildHeaders({});
     const session = headers["x-opencode-session"];
     expect(session).toMatch(OPENCODE_SESSION_RE);
     expect(headers["x-opencode-session-id"]).toBe(session);
-    expect(headers["x-opencode-client"]).toBe("cli");
-    expect(headers["x-opencode-request"]).toMatch(/^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$/);
-    expect("x-session-affinity" in headers).toBe(false);
-    expect("x-session-id" in headers).toBe(false);
+    expect(headers["x-session-affinity"]).toBe(session);
+    expect(headers["X-Session-Id"]).toBe(session);
+    expect(headers["x-opencode-client"]).toBe("opencode");
+    expect(headers["x-opencode-request"]).toMatch(/^req_/);
+    expect(headers["x-opencode-project"]).toMatch(/^[0-9a-f]{40}$/);
   });
 });
 
