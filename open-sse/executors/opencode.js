@@ -483,16 +483,19 @@ export class OpenCodeExecutor extends BaseExecutor {
 
     const session = credentials?.[SESSION_FIELD] || this.prepareRequestCredentials({ credentials })[SESSION_FIELD];
 
+    const projectHeader = lower["x-opencode-project"];
+    const validProject = typeof projectHeader === "string" && /^[0-9a-f]{40}$/i.test(projectHeader);
+
     // Mirrors the real v2 CLI wire shape: session id is sent on all four headers
     // (session, session-id, session-affinity, X-Session-Id), x-opencode-request
-    // is generated per request, and project id is dynamically randomized.
+    // is freshly generated per request, and project id is stably derived per session.
     const headers = {
       "Content-Type": "application/json",
       "Authorization": "Bearer public",
       "User-Agent": isOpencodeDownstream ? downstreamUa : OPENCODE_UA,
       "x-opencode-client": lower["x-opencode-client"] || OPENCODE_CLIENT,
-      "x-opencode-project": lower["x-opencode-project"] || generateProjectId(),
-      "x-opencode-request": lower["x-opencode-request"] || generateRequestId(),
+      "x-opencode-project": validProject ? projectHeader.toLowerCase() : generateProjectId(session),
+      "x-opencode-request": generateRequestId(),
       "x-opencode-session": session,
       "x-opencode-session-id": session,
       "x-session-affinity": session,
