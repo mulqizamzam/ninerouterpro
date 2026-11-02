@@ -240,44 +240,6 @@ function isMessagesModel(model) {
   return MESSAGES_MODELS.has(baseModelId(model));
 }
 
-const conversationSessions = new Map();
-const MAX_CONVERSATION_SESSIONS = 1000;
-
-function conversationSessionId(key) {
-  const existing = conversationSessions.get(key);
-  if (existing) {
-    existing.lastUsed = Date.now();
-    return existing.sessionId;
-  }
-  if (conversationSessions.size >= MAX_CONVERSATION_SESSIONS) {
-    conversationSessions.delete(conversationSessions.keys().next().value);
-  }
-  const sessionId = generateSessionId();
-  conversationSessions.set(key, { sessionId, lastUsed: Date.now() });
-  return sessionId;
-}
-
-function extractFirstMessageContent(body) {
-  try {
-    const items = Array.isArray(body?.messages) ? body.messages : (Array.isArray(body?.input) ? body.input : null);
-    if (!items || items.length === 0) return "";
-    const first = items[0];
-    if (!first) return "";
-    if (typeof first.content === "string") return first.content.slice(0, 500);
-    if (Array.isArray(first.content)) {
-      let text = "";
-      for (const part of first.content) {
-        text += part?.text || part?.input_text || part?.output || "";
-        if (text.length >= 500) break;
-      }
-      return text.slice(0, 500);
-    }
-  } catch {
-    return "";
-  }
-  return "";
-}
-
 function resolveOpencodeSession(body, credentials, providerSessionId, clientTool) {
   const headers = credentials?.rawHeaders || {};
   const native = nativeSession(headers);
@@ -297,16 +259,6 @@ function resolveOpencodeSession(body, credentials, providerSessionId, clientTool
   const explicitClient = body?.prompt_cache_key || body?.session_id || body?.conversation_id;
   if (explicitClient) {
     return translateSessionId(String(explicitClient), clientTool);
-  }
-
-  // Multi-turn conversation tracking: anchor on the first prompt of the conversation
-  // so turn 1 (user only) and turn 2+ (user + assistant) stay on the exact same session.
-  const firstPrompt = extractFirstMessageContent(body);
-  if (firstPrompt) {
-    const auth = credentials?.rawHeaders?.authorization || "";
-    const connectionId = credentials?.connectionId || "";
-    const convKey = `${connectionId}:${auth}:${crypto.createHash("sha256").update(firstPrompt).digest("hex")}`;
-    return conversationSessionId(convKey);
   }
 
   if (credentials?.connectionId || bodyHasSessionHints(body)) {
@@ -556,13 +508,13 @@ export class OpenCodeExecutor extends BaseExecutor {
 
     // Mirrors the real v2 CLI wire shape: session id is sent on all four headers
     // (session, session-id, session-affinity, X-Session-Id), x-opencode-request
-    // is freshly generated per request, and project id is stably derived per session.
+    // is freshly generated per request, and project id has stable 40-hex workspace identity.
     const headers = {
       "Content-Type": "application/json",
       "Authorization": "Bearer public",
       "User-Agent": isOpencodeDownstream ? downstreamUa : OPENCODE_UA,
       "x-opencode-client": lower["x-opencode-client"] || OPENCODE_CLIENT,
-      "x-opencode-project": validProject ? projectHeader.toLowerCase() : generateProjectId(session),
+      "x-opencode-project": validProject ? projectHeader.toLowerCase() : generateProjectId(credentials),
       "x-opencode-request": generateRequestId(),
       "x-opencode-session": session,
       "x-opencode-session-id": session,
