@@ -40,13 +40,8 @@ export const OPENCODE_SESSION_RE = /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/;
 const BASE62_CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
 function hasValidOpencodeVersion(ua) {
-  // Only the real current CLI shape passes through: the v2 channel shape
-  // ("opencode/<channel>/<major>.<minor>.<patch>/<client>") was the previous
-  // generation and now reads as a stale relay UA, so anything that is not the
-  // current "opencode/<version> ai-sdk/provider-utils/<v> runtime/bun/<v>"
-  // form is replaced with the current UA. Anything else (curl, python, a
-  // pinned UA) is not the CLI.
-  return /^opencode\/\d+\.\d+\.\d+ ai-sdk\/provider-utils\/[\d.]+ runtime\/bun\/[\d.]+$/i.test(String(ua || ""));
+  const m = String(ua || "").match(/^opencode\/[a-z0-9-]+\/(\d+)\.\d+\.\d+\/[a-z0-9-]+$/i);
+  return !!m && parseInt(m[1], 10) >= 2;
 }
 // Models served by /inference/v1/responses; every other model stays on /chat/completions.
 const RESPONSES_MODELS = new Set([
