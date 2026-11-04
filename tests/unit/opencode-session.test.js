@@ -196,10 +196,16 @@ describe("OpenCode Free User-Agent Validation", () => {
     }
   });
 
-  it("preserves a current opencode downstream User-Agent", () => {
+  it("preserves a current v2 opencode downstream User-Agent", () => {
+    const executor = getExecutor("opencode");
+    const headers = executor.buildHeaders({ rawHeaders: { "user-agent": "opencode/dev/2.0.29/opencode" } });
+    expect(headers["User-Agent"]).toBe("opencode/dev/2.0.29/opencode");
+  });
+
+  it("replaces legacy 1.19.x downstream User-Agent with the current v2 UA", () => {
     const executor = getExecutor("opencode");
     const headers = executor.buildHeaders({ rawHeaders: { "user-agent": "opencode/1.19.4 ai-sdk/provider-utils/4.0.23 runtime/bun/1.4.4" } });
-    expect(headers["User-Agent"]).toBe("opencode/1.19.4 ai-sdk/provider-utils/4.0.23 runtime/bun/1.4.4");
+    expect(headers["User-Agent"]).toBe("opencode/dev/0.0.0-dev-202610272228/opencode");
   });
 
   it("sends the v2 session headers, per-request request ID, and stable project ID", () => {
