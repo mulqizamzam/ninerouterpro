@@ -507,14 +507,13 @@ export class OpenCodeExecutor extends BaseExecutor {
     });
   }
 
-  // Free tier endpoints matching OpenCode 1.19+ CLI:
-  // OpenAI chat format routes to /inference/openai/v1/chat/completions,
-  // Anthropic messages format routes to /inference/anthropic/v1/messages.
+  // Free tier moved from /zen/v1 to /inference/v1 (OpenCode v2); /zen/v1 now
+  // answers every free request with 403 FreeTierError.
   buildUrl(model) {
     const base = this.config.baseUrl;
     if (isResponsesModel(model)) return `${base}/inference/v1/responses`;
-    if (isMessagesModel(model)) return `${base}/inference/anthropic/v1/messages`;
-    return `${base}/inference/openai/v1/chat/completions`;
+    if (isMessagesModel(model)) return `${base}/inference/v1/messages`;
+    return `${base}/inference/v1/chat/completions`;
   }
 
   buildHeaders(credentials, stream = true, url = "") {
