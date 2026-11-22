@@ -64,6 +64,21 @@ export const LAST_USED_OVERLAY_PRUNE_AGE_MS = 3600 * 1000;
 export const LAST_USED_FLUSH_DELAY_MS = 5000;
 export const LAST_USED_FLUSH_MAX_BATCH = 1000;
 
+// Least-busy routing (9Router Pro): pick the eligible connection with the
+// lowest live load instead of spreading evenly. The load signal is cheap
+// and bounded: in-flight picks counted in memory at selection time, plus
+// recent failures inside a short window. No timer, no polling, no new
+// dependency — stale in-flight entries age out lazily on the next read, so
+// an outcome that never reports (aborted stream, flaky retry) stops
+// counting after the stale window instead of wedging a key forever.
+export const LEAST_BUSY_IN_FLIGHT_WEIGHT = 10;
+export const LEAST_BUSY_RECENT_ERROR_WEIGHT = 4;
+export const LEAST_BUSY_RECENT_ERROR_WINDOW_MS = 5 * 60 * 1000;
+export const LEAST_BUSY_IN_FLIGHT_STALE_MS = 10 * 60 * 1000;
+export const LEAST_BUSY_MAX_ENTRIES = 8192;
+export const LEAST_BUSY_MAX_ERRORS_PER_KEY = 16;
+export const LEAST_BUSY_MAX_IN_FLIGHT_PER_KEY = 64;
+
 // A failure only earns the dashboard "unavailable" label when its cooldown
 // is at least this long. Short transient locks (seconds) must not brand a
 // healthy key as dead — the label outlives the lock and misleads operators.
@@ -84,8 +99,30 @@ export const SUSPECT_PROBATION_MS = 60 * 60 * 1000;
 export const PROVIDER_BREAKER_WINDOW_MS = 5 * 60 * 1000;
 export const PROVIDER_BREAKER_MIN_FAILURES = 5;
 export const PROVIDER_BREAKER_MIN_CONNECTIONS = 2;
+// Provider-wide trip bar (raised 2026-11-18, twice): the provider trip
+// is the blunt instrument — it parks EVERY model of a provider. It must
+// fire only on a genuinely broad outage, not on a burst. A burst of
+// 5 failures from 2 keys used to trip it; 15/5 (first retune) STILL
+// tripped under Hermes' load — dahl's flaky models fail often enough
+// that 15 failures from 5 keys in 5 min is routine, and it parked the
+// healthy models too. The per-model cooldown (MIN_FAILURES /
+// MIN_CONNECTIONS above) still parks a single bad model fast — the
+// provider bar is deliberately far higher, a last resort for a
+// catastrophic all-models-down outage only.
+export const PROVIDER_BREAKER_PROVIDER_MIN_FAILURES = 50;
+export const PROVIDER_BREAKER_PROVIDER_MIN_CONNECTIONS = 10;
+// Half-open probe tolerance (2026-11-18): the probe window used to
+// re-open on the FIRST failure, so a flaky-but-mostly-up provider
+// almost never recovered — every probe window re-opened on one unlucky
+// request. Now the probe tolerates one failure and only re-opens on
+// the second; a success still closes immediately, and a quiet window
+// still closes.
+export const PROVIDER_BREAKER_PROBE_MAX_FAILURES = 2;
 export const PROVIDER_BREAKER_OPEN_MS = 60 * 1000;
 export const PROVIDER_BREAKER_PROBE_MS = 30 * 1000;
+// Per-model cooldown ceiling: a model that keeps failing escalates
+// 60s → 120s → 240s → ... but never parks longer than 10 min at a time.
+export const PROVIDER_BREAKER_MODEL_COOLDOWN_MAX_MS = 10 * 60 * 1000;
 
 // Small-fleet rescue: when every connection of a small provider is locked
 // but the earliest lock lifts within this wait, selection retries that

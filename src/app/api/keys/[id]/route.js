@@ -3,6 +3,7 @@ import { deleteApiKey, getApiKeyById, getApiKeyByKey, getApiKeys, updateApiKey, 
 import { getKeyLimitUsage } from "@/lib/keyRateLimiter.js";
 import { validateKeyAccessInput } from "@/shared/utils/keyAccess.js";
 import { generateApiKeyWithMachine, prefixOfStandardKey, validateCustomKey } from "@/shared/utils/apiKey";
+import { toMaskedApiKeyRecord } from "@/shared/utils/maskApiKey.js";
 import { getConsistentMachineId } from "@/shared/utils/machineId";
 
 // GET /api/keys/[id] - Get single key
@@ -13,7 +14,20 @@ export async function GET(request, { params }) {
     if (!key) {
       return NextResponse.json({ error: "Key not found" }, { status: 404 });
     }
-    return NextResponse.json({ key });
+    // Live usage for the dashboard: the same snapshot PUT returns, so the
+    // "Live:" line in the key panel reflects current traffic instead of
+    // the page-load values from the list GET.
+    // Audit item 3: the stored value (hash, or legacy plaintext) never
+    // leaves the server on a read — only keyMasked / last4. Usage below is
+    // keyed by the stored value, so for a hashed row tpmUsed reads 0 (see
+    // the note in ../route.js); quota enforcement uses the presented key
+    // and is unaffected.
+    const savedLimits = await getKeyLimits(id);
+    key.limitsUsage = {
+      ...getKeyLimitUsage(id),
+      tpmUsed: savedLimits?.tpm ? await getKeyUsageInWindow(key.key, 1 / 60) : 0,
+    };
+    return NextResponse.json({ key: toMaskedApiKeyRecord(key) });
   } catch (error) {
     console.log("Error fetching key:", error);
     return NextResponse.json({ error: "Failed to fetch key" }, { status: 500 });
@@ -91,6 +105,15 @@ export async function PUT(request, { params }) {
       updateData.access = checked.value;
     }
 
+    // One-time disclosure (audit item 3 follow-up): when this PUT changed
+    // the key value (regenerate or customKey), the new plaintext exists
+    // only in updateData.key — updateApiKey hashes it on write, so the
+    // stored value is never recoverable afterwards. Capture it here so the
+    // response can show it once, exactly like POST 201. The dashboard's
+    // "API Key Regenerated" modal reads data.key.key; without this it
+    // showed the mask (or nothing) and rotation was unusable.
+    const newPlaintext = typeof updateData.key === "string" && updateData.key !== "" ? updateData.key : null;
+
     const updated = await updateApiKey(id, updateData);
 
     // Pro: token quota lives in KV, keyed by key id. `quota: null` clears it.
@@ -105,7 +128,7 @@ export async function PUT(request, { params }) {
     updated.quota = savedQuota;
     // Usage is keyed by key string: after a value change the NEW key counts,
     // so the response never reports the dead key's usage as the live one's.
-    updated.quotaUsed = savedQuota ? await getKeyUsageInWindow(updated.key, savedQuota.windowHours) : 0;
+    updated.quotaUsed = savedQuota ? await getKeyUsageInWindow(updated.key, savedQuota.windowHours, savedQuota.resetAt, savedQuota.absolute) : 0;
 
     // Pro: rate limits live in KV too. `limits: null` clears them.
     // opt46 (M1-key): same stored-first merge as bulk PATCH.
@@ -121,7 +144,14 @@ export async function PUT(request, { params }) {
       tpmUsed: savedLimits?.tpm ? await getKeyUsageInWindow(updated.key, 1 / 60) : 0,
     };
 
-    return NextResponse.json({ key: updated });
+    // Audit item 3: the response carries only keyMasked / last4, EXCEPT
+    // when this PUT regenerated or replaced the value — then the new
+    // plaintext is disclosed ONCE in `key` (the field the dashboard modal
+    // reads), mirroring POST 201. A read-only PUT (no value change) never
+    // carries a full value; the stored hash is never echoed.
+    const masked = toMaskedApiKeyRecord(updated);
+    if (newPlaintext) masked.key = newPlaintext;
+    return NextResponse.json({ key: masked });
   } catch (error) {
     console.log("Error updating key:", error);
     // opt13 M-I7: same race backstop as POST — DB unique violations 400.

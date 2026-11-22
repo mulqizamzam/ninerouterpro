@@ -1,7 +1,9 @@
 "use client";
 
 import { useState, useEffect, useCallback } from "react";
+import { createPortal } from "react-dom";
 import { Card, Button, Badge, Input, ModelSelectModal } from "@/shared/components";
+import { errorText } from "@/shared/utils/errorText";
 import { TOOL_HOSTS } from "@/shared/constants/mitmToolHosts";
 import Image from "next/image";
 
@@ -106,7 +108,7 @@ export default function MitmToolCard({
         body: JSON.stringify({ tool: tool.id, action, sudoPassword: password }),
       });
       const data = await res.json();
-      if (!res.ok) throw new Error(data.error || "Failed to toggle DNS");
+      if (!res.ok) throw new Error(errorText(data, "Failed to toggle DNS"));
 
       if (action === "enable") {
         setWarning(`Restart ${tool.name} to apply changes`);
@@ -271,8 +273,8 @@ export default function MitmToolCard({
         )}
       </Card>
 
-      {/* Password Modal */}
-      {showPasswordModal && (
+      {/* Password Modal — portaled to document.body (see Modal.js) */}
+      {showPasswordModal && createPortal(
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm">
           <div className="mx-4 flex w-full max-w-sm flex-col gap-4 rounded-xl border border-border bg-surface p-5 shadow-xl sm:p-6">
             <h3 className="font-semibold text-text-main">Sudo Password Required</h3>
@@ -302,7 +304,8 @@ export default function MitmToolCard({
               </Button>
             </div>
           </div>
-        </div>
+        </div>,
+        document.body
       )}
 
       {/* Model Select Modal */}

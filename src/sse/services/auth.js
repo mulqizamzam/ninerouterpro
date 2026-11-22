@@ -5,6 +5,7 @@ import { MAX_RATE_LIMIT_COOLDOWN_MS, BALANCED_WINDOW_SIZE, UNAVAILABLE_LABEL_MIN
 import { resolveProviderId, FREE_PROVIDERS } from "@/shared/constants/providers.js";
 import { getAntigravityQuotaCache, getAntigravityModelQuota } from "./antigravityQuota.js";
 import { providerBreakerGate, recordProviderFailure } from "./providerBreaker.js";
+import { pickLeastBusy, noteLeastBusyPick, noteLeastBusyRelease, leastBusyLoad } from "../../../open-sse/services/leastBusy.js";
 import * as log from "../utils/logger.js";
 
 // Dedicated mutex chain for round-robin / sticky-random account selection
@@ -113,6 +114,16 @@ function githubMonthlyResetMs(status, errorText, provider) {
  * @param {string} provider - Provider name
  * @param {Set<string>|string|null} excludeConnectionIds - Connection ID(s) to exclude (for retry with next account)
  * @param {string|null} model - Model name for per-model rate limit filtering
+ * @param {object} [options]
+ * @param {Array} [options.connections] - Preloaded active connections for this
+ *   provider (same filter as the internal load: provider + isActive). A caller
+ *   that retries within one member turn passes its snapshot so the pool is
+ *   loaded + decrypted once per turn instead of once per account attempt.
+ *   Freshness: failed accounts are excluded by the caller, and each member
+ *   turn loads its own snapshot, so locks written by earlier members are
+ *   still seen. A concurrent lock landing mid-turn may cost one wasted
+ *   attempt on that account before it is excluded — same as the rescue
+ *   path below, which already re-derives from one snapshot.
  */
 export async function getProviderCredentials(provider, excludeConnectionIds = null, model = null, options = {}) {
   // Normalize to Set for consistent handling
@@ -172,7 +183,8 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
       };
     }
 
-    const connections = await getProviderConnections({ provider: providerId, isActive: true });
+    const connections = options?.connections
+      ?? await getProviderConnections({ provider: providerId, isActive: true });
     log.debug("AUTH", `${provider} | total connections: ${connections.length}, excludeIds: ${excludeSet.size > 0 ? [...excludeSet].join(",") : "none"}, model: ${model || "any"}`);
 
     if (connections.length === 0) {
@@ -192,10 +204,11 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
       if (isModelLockActive(c, model)) return false;
       // Provider breaker (P3-27, layer 1): a tripped provider contributes
       // nothing until its probe window. Half-open reads as available —
-      // the first probe failure re-opens immediately.
-      if (providerBreakerGate(providerId) === "skip") {
+      // the first probe failure re-opens immediately. A model in cooldown
+      // is skipped while the rest of the provider keeps serving.
+      if (providerBreakerGate(providerId, model) === "skip") {
         // opt46: breaker skips are operationally significant — warn, not debug.
-        log.warn("AUTH", `${c.id?.slice(0, 8)} | provider breaker open for ${providerId} — skip`);
+        log.warn("AUTH", `${c.id?.slice(0, 8)} | provider breaker open for ${providerId}${model ? `/${model}` : ""} — skip`);
         return false;
       }
       // Kiro: an account whose profileArn could not be resolved (refresh
@@ -242,8 +255,17 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
 
     if (availableConnections.length === 0) {
       // Find earliest persistent lock or lazy Antigravity quota-cache reset for retry timing.
-      const lockedConns = connections.filter(c => isModelLockActive(c, model));
-      const expiries = lockedConns.map(c => getEarliestModelLockUntil(c)).filter(Boolean);
+      const lockedConns = connections.filter(c => isModelLockActive(c, model) && !excludeSet.has(c.id));
+      // C-6: only locks this request can still use count toward rescue
+      // timing — a lock owned by an already-tried (excluded) account can
+      // never free anything here, so waiting on it burns up to 45s.
+      // C-7: pair each expiry with its owning connection so the reported
+      // error belongs to the earliest lock, not to DB order.
+      const lockedByExpiry = lockedConns
+        .map(c => ({ conn: c, until: getEarliestModelLockUntil(c) }))
+        .filter(e => e.until)
+        .sort((a, b) => new Date(a.until) - new Date(b.until));
+      const expiries = lockedByExpiry.map(e => e.until);
       if (isAntigravity && model && antigravityQuotaCache) {
         connections.forEach((c) => {
           const connQuotas = antigravityQuotaCache.get(c.id);
@@ -267,7 +289,18 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
       if (!isAntigravity && earliest && connections.length <= SMALL_FLEET_RESCUE_MAX_CONNECTIONS) {
         const waitMs = new Date(earliest).getTime() - Date.now();
         if (waitMs <= SMALL_FLEET_RESCUE_MAX_WAIT_MS) {
+          // C-3: never hold the sticky mutex across the rescue wait — a
+          // 45s wait would queue every other sticky/round-robin pick for
+          // every provider behind it. Resolve now, re-acquire after the
+          // wait (same promise-chain discipline; the finally still
+          // resolves the re-acquired link).
+          if (resolveStickyMutex) resolveStickyMutex();
           if (waitMs > 0) await new Promise((r) => setTimeout(r, waitMs));
+          if (strategy === "round-robin" || strategy === "sticky-random") {
+            const currentMutex = stickySelectionMutex;
+            stickySelectionMutex = new Promise(resolve => { resolveStickyMutex = resolve; });
+            await currentMutex;
+          }
           availableConnections = connections.filter(isAvailable);
           if (availableConnections.length > 0) {
             log.warn("AUTH", `${provider} | small-fleet rescue: waited ${Math.max(0, waitMs)}ms for lock, ${availableConnections.length} account(s) free`);
@@ -281,7 +314,7 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
         }
       }
       if (availableConnections.length === 0 && earliest) {
-        const earliestConn = lockedConns[0];
+        const earliestConn = lockedByExpiry[0]?.conn || lockedConns[0];
         log.warn("AUTH", `${provider} | all ${connections.length} accounts locked for ${model || "all"} (${formatRetryAfter(earliest)}) | lastError=${earliestConn?.lastError?.slice(0, 50)}`);
         return {
           allRateLimited: true,
@@ -368,6 +401,25 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
           consecutiveUseCount: isFreshPick ? 1 : (connection.consecutiveUseCount || 0) + 1
         });
       }
+    } else if (strategy === "least-busy") {
+      // Least-busy (9Router Pro): within the clean tier, pick the
+      // connection carrying the fewest live requests, with recent
+      // failures as a penalty — agent clients hammering a multi-key
+      // provider (dahl) spread across farmed keys instead of piling
+      // onto one. Same clean-tier-first rule as balanced; only the
+      // within-tier rule differs (live load vs windowed LRU). Lock-free
+      // like balanced — the load counts are updated synchronously, so
+      // no mutex join is needed. The pick is stamped to the last-used
+      // overlay like balanced so the DB stamp stays consistent and
+      // concurrent picks keep spreading while a stream is still running.
+      const now = Date.now();
+      const clean = availableConnections.filter(c => connectionHealthTier(c, now, SUSPECT_PROBATION_MS) === 0);
+      const tier = clean.length > 0 ? clean : availableConnections;
+      connection = pickLeastBusy(tier, now, Math.random, leastBusyLoad, lastUsedOverlay);
+      if (connection) {
+        stampLastUsedOverlay(connection.id, now);
+        scheduleLastUsedFlush(connection.id, new Date(now).toISOString(), 1);
+      }
     } else if (strategy === "balanced") {
       // Balanced, lock-free (9Router Pro): clean accounts first — an
       // account that failed recently and has not proven itself since
@@ -393,6 +445,15 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
       // fill-first (already sorted by priority in getProviderConnections)
       connection = availableConnections[0];
     }
+
+    // Least-busy load accounting: every pick occupies its key until its
+    // outcome reports (clearAccountError on success,
+    // markAccountUnavailable on failure), whatever strategy picked it —
+    // the tracker only steers least-busy picks, but its in-flight counts
+    // must reflect real load. Synchronous here, before any await, so a
+    // concurrent pick in this process already sees this one as busy and
+    // spreads instead of piling on.
+    if (connection) noteLeastBusyPick(connection.id);
 
     const resolvedProxy = await resolveConnectionProxyConfig(connection.providerSpecificData || {});
 
@@ -441,13 +502,11 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
  */
 export async function markAccountUnavailable(connectionId, status, errorText, provider = null, model = null, resetsAtMs = null) {
   if (!connectionId || connectionId === "noauth") return { shouldFallback: false, cooldownMs: 0 };
-  // Sticky-random: a locked key stops being current for its route, so the
-  // next pick re-rolls instead of re-sticking to it. Only the entry that
-  // actually points at this key is dropped.
-  if (provider) {
-    const routeKey = stickyRouteKey(resolveProviderId(provider), model);
-    if (stickyCurrentByRoute.get(routeKey) === connectionId) stickyCurrentByRoute.delete(routeKey);
-  }
+  // Least-busy: the key's in-flight slot frees now, and the failure
+  // counts as a recent error even when this error is request-scoped
+  // (shouldFallback false below) — the key really did fail, so the
+  // penalty is deserved either way.
+  noteLeastBusyRelease(connectionId, false);
   // Fail open: a locked or busy DB must not kill the request. If the read
   // fails, the lock just won't persist — the caller still falls back on
   // the cooldown computed from the status alone.
@@ -471,24 +530,41 @@ export async function markAccountUnavailable(connectionId, status, errorText, pr
     newBackoffLevel = 0;
   } else if (resetsAtMs && resetsAtMs > Date.now()) {
     shouldFallback = true;
-    // Antigravity quota API provides exact per-model resetAt. Do not truncate it.
-    cooldownMs = resolveProviderId(provider) === "antigravity"
+    // C-5 (decision): an executor reset never SHORTENS the blind backoff —
+    // the cooldown is max(reset, backoff), and the backoff level keeps
+    // escalating instead of resetting to 0. Antigravity quota resets keep
+    // their exact, uncapped value as the reset side of the max.
+    const resetCooldownMs = resolveProviderId(provider) === "antigravity"
       ? resetsAtMs - Date.now()
       : Math.min(resetsAtMs - Date.now(), MAX_RATE_LIMIT_COOLDOWN_MS);
-    newBackoffLevel = 0;
+    const backoff = checkFallbackError(status, errorText, backoffLevel, resolveProviderId(provider));
+    cooldownMs = Math.max(resetCooldownMs, backoff.cooldownMs || 0);
+    newBackoffLevel = backoff.newBackoffLevel ?? backoffLevel;
   } else {
     ({ shouldFallback, cooldownMs, newBackoffLevel } = checkFallbackError(status, errorText, backoffLevel, resolveProviderId(provider)));
   }
   if (!shouldFallback) return { shouldFallback: false, cooldownMs: 0 };
 
+  // C-4: Sticky-random: a locked key stops being current for its route, so
+  // the next pick re-rolls instead of re-sticking to it. Only the entry
+  // that actually points at this key is dropped — and only once the call
+  // really locks (a request-scoped 400 or a 499 timer abort must NOT end
+  // stickiness for a healthy account).
+  if (provider) {
+    const routeKey = stickyRouteKey(resolveProviderId(provider), model);
+    if (stickyCurrentByRoute.get(routeKey) === connectionId) stickyCurrentByRoute.delete(routeKey);
+  }
+
   // Provider breaker (P3-27): only genuine outages count — 429, 5xx, or a
   // missing status (network failure). Auth failures (401/403) are
   // credential problems handled by quarantine; 402/404 are request-scoped
-  // and never reach here (shouldFallback is false for them).
+  // and never reach here (shouldFallback is false for them). The model is
+  // passed so a single bad model cools down on its own instead of
+  // tripping the whole provider.
   if (provider) {
     const s = Number(status);
     const isOutage = status == null || s === 429 || (Number.isFinite(s) && s >= 500);
-    if (isOutage) recordProviderFailure(resolveProviderId(provider), connectionId);
+    if (isOutage) recordProviderFailure(resolveProviderId(provider), connectionId, model);
   }
 
   const reason = typeof errorText === "string" ? errorText.slice(0, 200) : "Provider error";
@@ -561,6 +637,10 @@ export async function markAccountUnavailable(connectionId, status, errorText, pr
  */
 export async function clearAccountError(connectionId, currentConnection, model = null) {
   if (!connectionId || connectionId === "noauth") return;
+  // Least-busy: the key's in-flight slot frees now that its request
+  // succeeded (streaming replies hold the slot until the stream ends,
+  // which is exactly the load least-busy must see).
+  noteLeastBusyRelease(connectionId, true);
   const conn = currentConnection._connection || currentConnection;
   const now = Date.now();
   const allLockKeys = Object.keys(conn).filter(k => k.startsWith("modelLock_"));

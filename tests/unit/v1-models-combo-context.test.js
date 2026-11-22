@@ -9,7 +9,20 @@ const db = vi.hoisted(() => ({
   getInjectVariants: vi.fn(async () => ({})),
 }));
 
-vi.mock("@/lib/localDb", () => db);
+vi.mock("@/lib/localDb", async (importOriginal) => {
+  // Spread the real module so pure helpers the route imports (e.g.
+  // resolveComboContextWindow for the combo context-window mode) keep
+  // their real implementation; only the DB-backed readers are mocked.
+  const actual = await importOriginal();
+  return {
+    ...actual,
+    getProviderConnections: db.getProviderConnections,
+    getCombos: db.getCombos,
+    getCustomModels: db.getCustomModels,
+    getModelAliases: db.getModelAliases,
+    getInjectVariants: db.getInjectVariants,
+  };
+});
 vi.mock("@/lib/disabledModelsDb", () => ({
   getDisabledModels: vi.fn(async () => ({})),
 }));
@@ -103,5 +116,20 @@ describe("/v1/models combo limits", () => {
     const dupes = models.filter((model) => model.id === "dup-name");
     expect(dupes).toHaveLength(1);
     expect(dupes[0].owned_by).toBe("combo");
+  });
+
+  it("never publishes a combo prompt in /v1/models (issue #2)", async () => {
+    // Combo entries are built field-by-field, so the prompt must never
+    // leak into the public model list — not even as a key.
+    const combo = {
+      name: "prompted-combo",
+      models: ["ocg/mimo-v2.5"],
+      prompt: { mode: "single", content: "SECRET-PROMPT", turns: [], position: "append", enabled: true },
+    };
+    const models = await modelsWithCombo("opencode-go", "mimo-v2.5", [combo]);
+    const published = models.find((model) => model.id === combo.name);
+    expect(published).toBeDefined();
+    expect(published).not.toHaveProperty("prompt");
+    expect(JSON.stringify(published)).not.toContain("SECRET-PROMPT");
   });
 });

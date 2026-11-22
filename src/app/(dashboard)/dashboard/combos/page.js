@@ -812,6 +812,12 @@ function ComboCard({ combo, getCaps, comboByName = {}, activeProviders = [], act
                   {showAllModels ? "Show less" : `+${combo.models.length - 3} more`}
                 </button>
               )}
+              {/* Combo prompt (issue #2): one prompt for every member */}
+              {combo.prompt && (
+                <span title={combo.prompt.mode === "chat" ? "Combo prompt: chat script — fires for every member" : `Combo prompt (${combo.prompt.position || "append"}${combo.prompt.enabled === false ? ", disabled" : ""}) — fires for every member`}>
+                  <Badge variant="primary" size="sm" icon="chat">Prompt</Badge>
+                </span>
+              )}
             </div>
             {comboCaps && (
               <div className="mt-1 flex items-center gap-2 text-[10px] text-text-muted">
@@ -1216,7 +1222,7 @@ function ModelItem({ id, index, model, prefixById = {}, isFirst, isLast, onEdit,
 
   const handleKeyDown = (e) => {
     if (e.key === "Enter") commit();
-    if (e.key === "Escape") { setDraft(model); setEditing(false); }
+    if (e.key === "Escape") { e.stopPropagation(); setDraft(model); setEditing(false); }
   };
 
   return (
@@ -1311,7 +1317,7 @@ function ModelItem({ id, index, model, prefixById = {}, isFirst, isLast, onEdit,
 // Account pin picker (P3-28): picks one connection for a combo member.
 // The pin is advisory — an unavailable pinned connection falls back to
 // normal selection at request time (preferredConnectionId semantics).
-function PinPickerModal({ member, currentPin, onPick, onClose }) {
+function PinPickerModal({ member, currentPin, onPick, onClose, prefixById = {} }) {
   const [query, setQuery] = useState("");
   const [results, setResults] = useState([]);
   const [loading, setLoading] = useState(false);
@@ -1338,7 +1344,7 @@ function PinPickerModal({ member, currentPin, onPick, onClose }) {
   }, [providerId, query]);
 
   return (
-    <Modal isOpen onClose={onClose} title={`Pin account for ${member}`}>
+    <Modal isOpen onClose={onClose} title={`Pin account for ${displayBacking(member, prefixById)}`}>
       <div className="flex flex-col gap-3">
         <Input
           placeholder="Search by name or email…"
@@ -1392,6 +1398,14 @@ function ComboFormModal({ isOpen, combo, onClose, onSave, activeProviders, prefi
   // Initialize state with combo values - key prop on parent handles reset on remount
   const [name, setName] = useState(combo?.name || "");
   const [models, setModels] = useState(combo?.models || []);
+  // Combo prompt (issue #2): single-mode only in this form. A stored
+  // chat-mode prompt (set via API) is preserved untouched unless the
+  // user types a single prompt here, which replaces it.
+  const existingPrompt = combo?.prompt && typeof combo.prompt === "object" ? combo.prompt : null;
+  const [promptText, setPromptText] = useState(existingPrompt?.mode === "single" ? existingPrompt.content || "" : "");
+  const [promptPosition, setPromptPosition] = useState(existingPrompt?.position === "prepend" ? "prepend" : "append");
+  // Prompt templates (same library as Prompt Injection): pick one to fill the combo prompt
+  const [templates, setTemplates] = useState([]);
   const [showModelSelect, setShowModelSelect] = useState(false);
   const [pinMember, setPinMember] = useState(null);
   const [saving, setSaving] = useState(false);
@@ -1420,11 +1434,32 @@ function ComboFormModal({ isOpen, combo, onClose, onSave, activeProviders, prefi
   const fetchModalData = async () => {
     try {
       const aliasesRes = await fetch("/api/models/alias");
-      if (!aliasesRes.ok) return;
-      const aliasesData = await aliasesRes.json();
-      setModelAliases(aliasesData.aliases || {});
+      if (aliasesRes.ok) {
+        const aliasesData = await aliasesRes.json();
+        setModelAliases(aliasesData.aliases || {});
+      }
     } catch (error) {
       console.error("Error fetching modal data:", error);
+    }
+    try {
+      const injRes = await fetch("/api/prompt-injection");
+      if (injRes.ok) {
+        const inj = await injRes.json();
+        const list = Array.isArray(inj.templates) ? inj.templates : [];
+        // Combo prompt is single-mode only: chat-script templates have no content to fill
+        setTemplates(list.filter((t) => t.mode !== "chat" && (t.content || "").trim()));
+      }
+    } catch (error) {
+      console.error("Error fetching prompt templates:", error);
+    }
+  };
+
+  const handleTemplatePick = (e) => {
+    const template = templates.find((t) => String(t.id) === e.target.value);
+    if (!template) return;
+    setPromptText(template.content || "");
+    if (template.position === "prepend" || template.position === "append") {
+      setPromptPosition(template.position);
     }
   };
 
@@ -1483,7 +1518,24 @@ function ComboFormModal({ isOpen, combo, onClose, onSave, activeProviders, prefi
   const handleSave = async () => {
     if (!validateName(name)) return;
     setSaving(true);
-    await onSave({ name: name.trim(), models });
+    // Combo prompt (issue #2): typed text saves as a single prompt
+    // (keeping the previous enabled flag when editing a single prompt);
+    // clearing a set single prompt sends null; leaving it empty when
+    // nothing was set — or when a chat-mode prompt is stored — omits
+    // the key so the server keeps the stored prompt untouched.
+    const promptPatch = {};
+    if (promptText.trim()) {
+      promptPatch.prompt = {
+        mode: "single",
+        content: promptText.trim(),
+        turns: [],
+        position: promptPosition,
+        enabled: existingPrompt?.mode === "single" ? existingPrompt.enabled !== false : true,
+      };
+    } else if (existingPrompt?.mode === "single" && (existingPrompt.content || "").trim()) {
+      promptPatch.prompt = null;
+    }
+    await onSave({ name: name.trim(), models, ...promptPatch });
     setSaving(false);
   };
 
@@ -1560,6 +1612,45 @@ function ComboFormModal({ isOpen, combo, onClose, onSave, activeProviders, prefi
             </button>
           </div>
 
+          {/* Combo prompt (issue #2): one prompt for every member, fired before each member's own prompt */}
+          <div>
+            <label className="text-sm font-medium mb-1.5 block">Combo prompt <span className="text-text-muted font-normal">(optional)</span></label>
+            {templates.length > 0 && (
+              <div className="mb-1.5">
+                <Select
+                  options={templates.map((t) => ({ value: String(t.id), label: t.name }))}
+                  value=""
+                  onChange={handleTemplatePick}
+                  placeholder="Use a template…"
+                  selectClassName="py-1.5 text-xs"
+                />
+              </div>
+            )}
+            <textarea
+              value={promptText}
+              onChange={(e) => setPromptText(e.target.value)}
+              rows={4}
+              placeholder="System prompt applied to every member of this combo…"
+              className="w-full rounded-lg border border-border bg-surface px-3 py-2 font-mono text-[13px] leading-relaxed"
+            />
+            <div className="mt-1.5">
+              <Select
+                options={[
+                  { value: "append", label: "Append — after the system prompt" },
+                  { value: "prepend", label: "Prepend — before the system prompt" },
+                ]}
+                value={promptPosition}
+                onChange={(e) => setPromptPosition(e.target.value)}
+                selectClassName="py-1.5 text-xs"
+              />
+            </div>
+            {existingPrompt?.mode === "chat" ? (
+              <p className="text-[10px] text-text-muted mt-0.5">This combo has a chat-mode prompt (set via API). Saving a single prompt here replaces it; leaving this empty keeps it.</p>
+            ) : (
+              <p className="text-[10px] text-text-muted mt-0.5">Fires for every member, before each member&apos;s own prompt. Empty = no combo prompt.</p>
+            )}
+          </div>
+
           {/* Actions */}
           <div className="flex flex-col gap-2 pt-1 sm:flex-row">
             <Button onClick={onClose} variant="ghost" fullWidth size="sm">
@@ -1598,6 +1689,7 @@ function ComboFormModal({ isOpen, combo, onClose, onSave, activeProviders, prefi
         <PinPickerModal
           member={pinMember}
           currentPin={pins?.[pinMember] || null}
+          prefixById={prefixById}
           onPick={(pin) => {
             onPinChange(pinMember, pin);
             setPinMember(null);

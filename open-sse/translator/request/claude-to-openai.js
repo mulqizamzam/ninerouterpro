@@ -28,17 +28,41 @@ export function claudeToOpenAIRequest(model, body, stream) {
     result.temperature = body.temperature;
   }
 
-  // System message
+  // System message. A cache_control marker on a system block is carried
+  // through as array content: a plain string cannot hold one, and the
+  // downstream filterToOpenAIFormat keeps the array (with the marker) only
+  // for providers whose preserveCacheControl quirk opts in — every other
+  // provider gets the marker stripped and the parts collapsed back to a
+  // string, exactly as before.
   if (body.system) {
-    const systemContent = Array.isArray(body.system)
-      ? body.system.map(s => stripAnthropicBillingHeader(s.text || "")).filter(Boolean).join("\n")
-      : stripAnthropicBillingHeader(body.system);
-    
-    if (systemContent) {
-      result.messages.push({
-        role: ROLE.SYSTEM,
-        content: systemContent
-      });
+    const systemBlocks = Array.isArray(body.system) ? body.system : null;
+    const hasSystemCache = systemBlocks?.some((s) => s?.cache_control);
+    if (hasSystemCache) {
+      const parts = systemBlocks
+        .map((s) => {
+          const text = stripAnthropicBillingHeader(s.text || "");
+          if (!text) return null;
+          return {
+            type: OPENAI_BLOCK.TEXT,
+            text,
+            ...(s.cache_control ? { cache_control: { ...s.cache_control } } : {}),
+          };
+        })
+        .filter(Boolean);
+      if (parts.length) {
+        result.messages.push({ role: ROLE.SYSTEM, content: parts });
+      }
+    } else {
+      const systemContent = Array.isArray(body.system)
+        ? body.system.map(s => stripAnthropicBillingHeader(s.text || "")).filter(Boolean).join("\n")
+        : stripAnthropicBillingHeader(body.system);
+
+      if (systemContent) {
+        result.messages.push({
+          role: ROLE.SYSTEM,
+          content: systemContent
+        });
+      }
     }
   }
 
@@ -167,11 +191,39 @@ function convertClaudeMessage(msg) {
     const parts = [];
     const toolCalls = [];
     const toolResults = [];
+    let reasoningText = "";
+    const redactedThinking = [];
 
     for (const block of msg.content) {
       switch (block.type) {
         case CLAUDE_BLOCK.TEXT:
-          parts.push({ type: OPENAI_BLOCK.TEXT, text: block.text });
+          // Carry the client's cache_control through: the downstream
+          // filterToOpenAIFormat preserves it only for providers that opt
+          // in via preserveCacheControl (e.g. alicode/DashScope) and strips
+          // it for everyone else. collapseTextParts keeps marked parts as
+          // an array — a string could not hold the marker.
+          parts.push({
+            type: OPENAI_BLOCK.TEXT,
+            text: block.text,
+            ...(block.cache_control ? { cache_control: { ...block.cache_control } } : {}),
+          });
+          break;
+
+        case CLAUDE_BLOCK.THINKING:
+          // Caller-sent thinking (e.g. Claude Code history) used to fall
+          // through silently, losing the reasoning on the bridge leg. Carry
+          // the text as reasoning_content on the assistant message.
+          if (typeof block.thinking === "string" && block.thinking) {
+            reasoningText += (reasoningText ? "\n" : "") + block.thinking;
+          }
+          break;
+
+        case CLAUDE_BLOCK.REDACTED_THINKING:
+          // No plaintext form exists; keep the encrypted blob restorable in
+          // provider_specific_fields instead of dropping it.
+          if (block.data) {
+            redactedThinking.push({ data: block.data });
+          }
           break;
 
         case CLAUDE_BLOCK.IMAGE:
@@ -197,6 +249,11 @@ function convertClaudeMessage(msg) {
           break;
 
         case CLAUDE_BLOCK.TOOL_RESULT: {
+          // NOTE: a cache_control on the tool_result block is deliberately
+          // NOT carried here. The OpenAI tool role is text-only — there is
+          // no content-block array to hold the marker — and the downstream
+          // filter returns tool messages as-is, so attaching it to the tool
+          // message would leak it to providers that do not support caching.
           let resultContent = "";
           const resultImages = [];
           if (typeof block.content === "string") {
@@ -248,16 +305,42 @@ function convertClaudeMessage(msg) {
       if (parts.length > 0) {
         result.content = collapseTextParts(parts);
       }
+      if (reasoningText) {
+        result.reasoning_content = reasoningText;
+      }
+      if (redactedThinking.length > 0) {
+        result.provider_specific_fields = { redacted_thinking: redactedThinking };
+      }
       result.tool_calls = toolCalls;
       return result;
     }
 
     // Return content
     if (parts.length > 0) {
-      return {
+      const result = {
         role,
         content: collapseTextParts(parts)
       };
+      if (reasoningText) {
+        result.reasoning_content = reasoningText;
+      }
+      if (redactedThinking.length > 0) {
+        result.provider_specific_fields = { redacted_thinking: redactedThinking };
+      }
+      return result;
+    }
+
+    // Thinking-only message: the reasoning is the whole content — it must not
+    // vanish into a null message.
+    if (reasoningText || redactedThinking.length > 0) {
+      const result = { role: ROLE.ASSISTANT };
+      if (reasoningText) {
+        result.reasoning_content = reasoningText;
+      }
+      if (redactedThinking.length > 0) {
+        result.provider_specific_fields = { redacted_thinking: redactedThinking };
+      }
+      return result;
     }
     
     // Empty content array

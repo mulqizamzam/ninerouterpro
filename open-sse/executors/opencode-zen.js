@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import { DefaultExecutor } from "./default.js";
+import { parseOpencodeRateLimitReset } from "../utils/opencodeResetTime.js";
 import { resolveSessionId } from "../utils/sessionManager.js";
 import { isMuseSparkModel, isOpencodeFreeTierModel } from "../providers/models/helpers.js";
 import {
@@ -17,7 +18,7 @@ const RESPONSES_BASE_URL = "https://opencode.ai/inference/v1/responses";
 const MAX_TOOL_NAME_LEN = 128;
 // Same current-CLI shape as the opencode executor (reverse-engineered
 // 2026-10-23 via mitmproxy): the zen lane keys off the same fingerprint.
-const OPENCODE_UA = "opencode/1.19.4 ai-sdk/provider-utils/4.0.23 runtime/bun/1.4.4";
+const OPENCODE_UA = "opencode/latest/2.2.5/cli";
 export const OPENCODE_SESSION_RE = /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/;
 const BASE62_CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 // Free-tier fingerprint (mirrors opencode executor, PR #4132): upstream 403s
@@ -25,11 +26,12 @@ const BASE62_CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuv
 const OPENCODE_FINGERPRINT_TOOLS = ["bash", "glob", "grep", "read"];
 
 function hasValidOpencodeVersion(ua) {
-  const m = String(ua || "").match(/opencode\/(\d+)\.(\d+)(?:\.(\d+))?/i);
-  if (!m) return false;
-  const major = parseInt(m[1], 10);
-  const minor = parseInt(m[2], 10);
-  return major > 1 || (major === 1 && minor >= 17);
+  // Aligned with the main opencode executor: only the v2 channel shape
+  // ("opencode/<channel>/<major>.<minor>.<patch>/<client>") with major >= 2
+  // passes through. The old numeric rule accepted forms the v2 gate no
+  // longer treats as a current client.
+  const m = String(ua || "").match(/^opencode\/[a-z0-9-]+\/(\d+)\.\d+\.\d+\/[a-z0-9-]+$/i);
+  return !!m && parseInt(m[1], 10) >= 2;
 }
 
 function unstableRandom() {
@@ -240,6 +242,14 @@ export class OpenCodeZenExecutor extends DefaultExecutor {
     super("opencode-zen");
   }
 
+  // Same upstream free-tier 429 shape as the main opencode executor — parse
+  // the precise resetsAtMs; fallback to default otherwise
+  parseError(response, bodyText) {
+    const reset = parseOpencodeRateLimitReset(response, bodyText);
+    if (reset) return { status: 429, message: reset.message, resetsAtMs: reset.resetsAtMs };
+    return super.parseError(response, bodyText);
+  }
+
   buildUrl(model, stream, urlIndex = 0, credentials = null) {
     // Muse Spark lives on /responses even when a stale runtimeTransport leaks in.
     if (isResponsesModel(model)) return RESPONSES_BASE_URL;
@@ -288,9 +298,9 @@ export class OpenCodeZenExecutor extends DefaultExecutor {
       // Free-tier models are gated behind the attested free-tier identity even
       // on the keyed lane: a real oc_sk_* key answers 403 FreeTierError, while
       // `Bearer public` + session/request ids succeed. Paid models keep the
-      // connection key untouched.
+      // connection key untouched. No x-opencode-request: the v2 gate rejects
+      // that v1-only header with 403 (same port as the main executor).
       headers["Authorization"] = "Bearer public";
-      headers["x-opencode-request"] = generateRequestId();
     }
     return headers;
   }

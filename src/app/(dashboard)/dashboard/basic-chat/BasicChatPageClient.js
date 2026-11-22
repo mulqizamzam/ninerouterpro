@@ -3,12 +3,13 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Badge, Button } from "@/shared/components";
 import { getModelsByProviderId } from "@/shared/constants/models";
-import { isAnthropicCompatibleProvider, isOpenAICompatibleProvider } from "@/shared/constants/providers";
+import { FREE_PROVIDERS, isAnthropicCompatibleProvider, isOpenAICompatibleProvider } from "@/shared/constants/providers";
 
 const STORAGE_KEYS = {
   sessions: "basic-chat.sessions",
   activeSessionId: "basic-chat.activeSessionId",
   activeProviderId: "basic-chat.activeProviderId",
+  apiKeyId: "basic-chat.apiKeyId",
   draft: "basic-chat.draft",
 };
 
@@ -166,6 +167,35 @@ function dedupeModels(models) {
   return Array.from(map.values());
 }
 
+// No-auth free providers serve through the router's virtual connection
+// (see auth.js), so they need no stored connection. Surface their static
+// models as virtual groups so Basic Chat works on a fresh install instead
+// of dead-ending with "No providers connected yet." Hidden lanes (e.g.
+// mimo-free, whose free channel ended) are never surfaced.
+function buildFreeProviderGroups() {
+  const groups = [];
+  for (const provider of Object.values(FREE_PROVIDERS || {})) {
+    if (!provider?.noAuth || provider.hidden) continue;
+    const kinds = Array.isArray(provider.serviceKinds) && provider.serviceKinds.length > 0
+      ? provider.serviceKinds
+      : ["llm"];
+    if (!kinds.includes("llm")) continue;
+    const connection = { id: "noauth", provider: provider.id, name: provider.name || humanize(provider.id) };
+    const models = getModelsByProviderId(provider.id)
+      .map((model) => normalizeStaticModel(model, connection))
+      .filter(Boolean);
+    if (!models.length) continue;
+    groups.push({
+      providerId: provider.id,
+      providerName: connection.name,
+      providerType: "free",
+      connections: [connection],
+      models: dedupeModels(models).sort((a, b) => a.name.localeCompare(b.name)),
+    });
+  }
+  return groups.sort((a, b) => a.providerName.localeCompare(b.providerName));
+}
+
 export default function BasicChatPageClient() {
   const [providerGroups, setProviderGroups] = useState([]);
   const [loadingData, setLoadingData] = useState(true);
@@ -189,6 +219,11 @@ export default function BasicChatPageClient() {
     return globalThis.localStorage.getItem(STORAGE_KEYS.activeProviderId) || "";
   });
   const [activeModelId, setActiveModelId] = useState("");
+  const [apiKeys, setApiKeys] = useState([]);
+  const [activeApiKeyId, setActiveApiKeyId] = useState(() => {
+    if (typeof window === "undefined") return "";
+    return globalThis.localStorage.getItem(STORAGE_KEYS.apiKeyId) || "";
+  });
   const [draft, setDraft] = useState(() => {
     if (typeof window === "undefined") return "";
     return globalThis.localStorage.getItem(STORAGE_KEYS.draft) || "";
@@ -210,6 +245,28 @@ export default function BasicChatPageClient() {
     setIsHydrated(true);
   }, []);
 
+  // API keys for sending: Basic Chat talks to the public LLM pipeline
+  // (/v1/chat/completions), which authenticates by API key — the same
+  // pattern as the prompt-injection tester. The old code posted to
+  // /api/dashboard/chat/completions, a route that never existed (404 on
+  // every send). Keys are dashboard-gated; only names + last 4 chars are
+  // ever rendered, the value itself only goes into the Authorization header.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch("/api/keys", { cache: "no-store" });
+        const data = await res.json().catch(() => ({}));
+        if (cancelled || !Array.isArray(data.keys)) return;
+        const usable = data.keys.filter((k) => k?.key);
+        setApiKeys(usable);
+        const saved = globalThis.localStorage.getItem(STORAGE_KEYS.apiKeyId) || "";
+        if (!saved && usable.length > 0) setActiveApiKeyId(usable[0].id);
+      } catch { /* keys optional; send surfaces the error */ }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
   useEffect(() => {
     let cancelled = false;
 
@@ -225,9 +282,14 @@ export default function BasicChatPageClient() {
           : [];
 
         if (connections.length === 0) {
+          // No stored connections — but the no-auth free lane serves
+          // through a virtual connection, so offer its models instead of
+          // a dead end. The user still needs an API key to send (the key
+          // picker already points at Endpoint & Key when none exists).
+          const freeGroups = buildFreeProviderGroups();
           if (!cancelled) {
-            setProviderGroups([]);
-            setLoadError("No providers connected yet.");
+            setProviderGroups(freeGroups);
+            if (freeGroups.length === 0) setLoadError("No providers connected yet.");
           }
           return;
         }
@@ -380,11 +442,12 @@ export default function BasicChatPageClient() {
       globalThis.localStorage.setItem(STORAGE_KEYS.sessions, JSON.stringify(sessions));
       globalThis.localStorage.setItem(STORAGE_KEYS.activeSessionId, activeSessionId);
       globalThis.localStorage.setItem(STORAGE_KEYS.activeProviderId, activeProviderId);
+      globalThis.localStorage.setItem(STORAGE_KEYS.apiKeyId, activeApiKeyId);
       globalThis.localStorage.setItem(STORAGE_KEYS.draft, draft);
     } catch {
       // Ignore storage errors.
     }
-  }, [isHydrated, sessions, activeSessionId, activeProviderId, draft]);
+  }, [isHydrated, sessions, activeSessionId, activeProviderId, activeApiKeyId, draft]);
 
   useEffect(() => {
     if (!isHydrated || loadingData || initializedRef.current) return;
@@ -585,6 +648,17 @@ export default function BasicChatPageClient() {
     const model = activeModel || activeProviderGroup?.models?.[0] || null;
     if (!model) return;
 
+    // The LLM pipeline authenticates by API key (requireApiKey defaults
+    // true). With keys available but none picked, fail here with a clear
+    // message instead of a bare 401 mid-stream. With no keys at all, send
+    // without a header and let the server decide (local mode works when
+    // requireApiKey is off; otherwise its 401 surfaces below).
+    const apiKey = apiKeys.find((k) => k.id === activeApiKeyId)?.key || null;
+    if (apiKeys.length > 0 && !apiKey) {
+      setLoadError("Pilih API key dulu untuk mengirim (buat di Endpoint & Key bila belum ada).");
+      return;
+    }
+
     const userText = draft.trim();
     if (!userText && attachments.length === 0) return;
 
@@ -647,11 +721,12 @@ export default function BasicChatPageClient() {
       }));
 
     try {
-      const response = await fetch("/api/dashboard/chat/completions", {
+      const response = await fetch("/v1/chat/completions", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           Accept: "text/event-stream",
+          ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
         },
         body: JSON.stringify({
           model: model.requestModel || model.id,
@@ -810,6 +885,22 @@ export default function BasicChatPageClient() {
           </div>
 
           <div className="flex items-center gap-2">
+            <select
+              value={activeApiKeyId}
+              onChange={(event) => setActiveApiKeyId(event.target.value)}
+              aria-label="API key"
+              className="max-w-[180px] truncate rounded-2xl border border-white/10 bg-white/5 px-3 py-3 text-sm text-white/80 transition hover:bg-white/8"
+            >
+              {apiKeys.length === 0 ? (
+                <option value="">Buat API key dulu di Endpoint &amp; Key</option>
+              ) : (
+                apiKeys.map((k) => (
+                  <option key={k.id} value={k.id}>
+                    {k.name || k.id} (…{String(k.key).slice(-4)})
+                  </option>
+                ))
+              )}
+            </select>
             <button
               type="button"
               onClick={() => setHistoryOpen((value) => !value)}
@@ -879,6 +970,15 @@ export default function BasicChatPageClient() {
                     <p className="text-sm leading-6 text-white/60">
                       Simple chat interface to interact with any AI model from connected providers. Select a model and start chatting!
                     </p>
+                    {apiKeys.length === 0 ? (
+                      <p className="text-sm leading-6 text-white/60">
+                        Belum ada API key —{" "}
+                        <a href="/dashboard/endpoint" className="font-semibold text-violet-300 underline">
+                          buat dulu di Endpoint &amp; Key
+                        </a>
+                        , lalu kirim pesan pertama kamu (model gratis sudah tersedia, tanpa provider).
+                      </p>
+                    ) : null}
                   </div>
                 </div>
               </div>

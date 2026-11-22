@@ -1,8 +1,9 @@
 import { Inter, Space_Grotesk, Playfair_Display, Pacifico, Poppins, Montserrat, Bebas_Neue, Anton, Orbitron, Lobster, Bangers, Zilla_Slab, Great_Vibes, Caveat, JetBrains_Mono, Special_Elite, Press_Start_2P, Audiowide, Monoton, Rubik_Glitch, Michroma, VT323, Nunito } from "next/font/google";
 import { GoogleAnalytics } from "@next/third-parties/google";
-import "material-symbols/outlined.css";
+import "./fonts/material-symbols-outlined-subset.css";
 import "./globals.css";
 import { ThemeProvider } from "@/shared/components/ThemeProvider";
+import { ChunkSelfHeal } from "@/shared/components/ChunkSelfHeal";
 import "@/lib/network/initOutboundProxy"; // Auto-initialize outbound proxy env
 import "@/shared/services/bootstrap"; // Auto-run initializeApp (watchdog, auto-resume tunnel)
 import { initConsoleLogCapture } from "@/lib/consoleLogBuffer";
@@ -104,6 +105,7 @@ export default function RootLayout({ children }) {
         />
       </head>
       <body className={`${inter.variable} ${spaceGrotesk.variable} ${playfair.variable} ${pacifico.variable} ${poppins.variable} ${montserrat.variable} ${bebas.variable} ${anton.variable} ${orbitron.variable} ${lobster.variable} ${bangers.variable} ${zilla.variable} ${vibes.variable} ${caveat.variable} ${jetbrains.variable} ${special.variable} ${pixel.variable} ${audiowide.variable} ${monoton.variable} ${glitch.variable} ${michroma.variable} ${vt323.variable} ${nunito.variable} font-sans antialiased`}>
+        <ChunkSelfHeal />
         <ThemeProvider>
           <RuntimeI18nProvider>
             {children}

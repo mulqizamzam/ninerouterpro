@@ -1,6 +1,7 @@
 import { HTTP_STATUS, RETRY_CONFIG, DEFAULT_RETRY_CONFIG, resolveRetryEntry, FETCH_CONNECT_TIMEOUT_MS } from "../config/runtimeConfig.js";
 import { shouldRefreshCredentials } from "../services/oauthCredentialManager.js";
 import { proxyAwareFetch } from "../utils/proxyFetch.js";
+import { stableJsonStringify } from "../utils/stableJson.js";
 import { dbg } from "../utils/debugLog.js";
 import { ANTHROPIC_API_VERSION, OPENAI_COMPAT_BASE, ANTHROPIC_COMPAT_BASE } from "../providers/shared.js";
 import { resolveOpenAICompatibleApiType } from "../services/provider.js";
@@ -140,7 +141,10 @@ export class BaseExecutor {
       const mergedSignal = signal ? AbortSignal.any([signal, connectCtrl.signal]) : connectCtrl.signal;
 
       try {
-        const bodyStr = JSON.stringify(transformedBody);
+        // Stable key order so the same logical request always serializes to
+        // the same bytes — keeps upstream prefix caching alive (see
+        // utils/stableJson.js). Semantics match JSON.stringify.
+        const bodyStr = stableJsonStringify(transformedBody);
         const fetchT0 = Date.now();
         dbg("FETCH", `${this.provider.toUpperCase()} → ${url} | body=${bodyStr.length}B | connectTimeout=${timeoutMs}ms`);
         const response = await proxyAwareFetch(url, {
@@ -187,7 +191,11 @@ export class BaseExecutor {
         // tokenjuice signature of 2026-11-02 — while the combo / client
         // retry layers are the proper fallback. Fail this attempt fast; a
         // different fallback URL (if any) is still tried below.
-        const isFetchConnectTimeout = error?.message === "fetch connect timeout";
+        // Gate on the abort signal itself, not on the message string: the
+        // timer is the only thing that aborts connectCtrl, so signal.aborted
+        // is true exactly for connect timeouts even when the surfaced error
+        // is a generic AbortError instead of "fetch connect timeout".
+        const isFetchConnectTimeout = connectCtrl.signal.aborted;
         if (!isFetchConnectTimeout && await tryRetry(urlIndex, HTTP_STATUS.BAD_GATEWAY, `network "${error.message}"`)) { urlIndex--; continue; }
 
         if (urlIndex + 1 < fallbackCount) {

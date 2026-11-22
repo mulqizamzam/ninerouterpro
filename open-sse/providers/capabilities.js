@@ -94,7 +94,12 @@ export const MODEL_CAPABILITIES = {
     maxOutput: 131072,
   },
   // Claude Fable 5.1, Opus 5.5/5, 4.6/4.7/4.8, and Kiro Sonnet 5 have 1M context + adaptive thinking (override generic claude pattern)
+  "claude-fable-5-2": { vision: true, pdf: true, reasoning: true, search: true, thinkingFormat: "claude-adaptive", thinkingCanDisable: false, contextWindow: 1000000, maxOutput: 128000 },
   "claude-fable-5-1": { vision: true, pdf: true, reasoning: true, search: true, thinkingFormat: "claude-adaptive", thinkingCanDisable: false, contextWindow: 1000000, maxOutput: 128000 },
+  // Claude Haiku 5.5 is adaptive-only globally (1M/128K): the budget shape the
+  // generic *claude*haiku* pattern sends comes back 400 "thinking.type.enabled"
+  // is not supported for this model. The explicit row wins over the pattern.
+  "claude-haiku-5-5": { vision: true, pdf: true, reasoning: true, search: true, thinkingFormat: "claude-adaptive", contextWindow: 1000000, maxOutput: 128000 },
   // Claude Opus 5.5 / Sonnet 5.5 dotted ids: Kiro preview (rateMultiplier: 2.0, 1M context) (#4410),
   // GitHub Copilot and Token Harbor. Same models as the dashed rows below, so the same 400s
   // apply: Opus 5.5 rejects thinking.type "disabled", Sonnet 5.5 takes "between_tools" in its
@@ -241,11 +246,19 @@ export const PROVIDER_CAPABILITIES = {
   // NVIDIA NIM is OpenAI-compatible → rejects MiniMax/GLM native `thinking` field.
   // Force openai reasoning_effort format for its reasoning models. #issue
   "nvidia": {
-    "minimaxai/minimax-m2.7": { reasoning: true, thinkingFormat: "openai", thinkingCanDisable: false, contextWindow: 200000, maxOutput: 131072 },
-    "minimaxai/minimax-m3": { vision: true, reasoning: true, thinkingFormat: "openai", thinkingCanDisable: false, contextWindow: 512000, maxOutput: 131072 },
-    "z-ai/glm-5.2": { reasoning: true, thinkingFormat: "openai", contextWindow: 200000, maxOutput: 128000 },
-    "deepseek-ai/deepseek-v4-pro": { reasoning: true, thinkingFormat: "openai", contextWindow: 1000000, maxOutput: 65536 },
-    "deepseek-ai/deepseek-v4-flash": { reasoning: true, thinkingFormat: "openai", contextWindow: 1000000, maxOutput: 65536 },
+    "nvidia/nemotron-3.5-bolt-e4b": { tools: true, contextWindow: 128000, maxOutput: 8192 },
+    "nvidia/nemotron-3.5-lightning-30b-a3b": { tools: false, reasoning: true, thinkingFormat: "openai", contextWindow: 128000, maxOutput: 8192 },
+    "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning": { tools: false, reasoning: true, thinkingFormat: "openai", contextWindow: 128000, maxOutput: 8192 },
+    "nvidia/nemotron-3-ultra-550b-a55b": { tools: false, reasoning: true, thinkingFormat: "openai", contextWindow: 128000, maxOutput: 8192 },
+    "poolside/laguna-xs-2.1": { tools: true, contextWindow: 200000, maxOutput: 32000 },
+    "meta/llama-guard-4-12b": { tools: false, contextWindow: 128000, maxOutput: 4096 },
+    "nvidia/riva-translate-4b-instruct-v2": { tools: false, contextWindow: 128000, maxOutput: 4096 },
+    "meta/llama-3.3-70b-instruct": { tools: true, contextWindow: 128000, maxOutput: 4096 },
+    "minimaxai/minimax-m2.7": { tools: false, reasoning: true, thinkingFormat: "openai", thinkingCanDisable: false, contextWindow: 200000, maxOutput: 131072 },
+    "minimaxai/minimax-m3": { tools: false, vision: true, reasoning: true, thinkingFormat: "openai", thinkingCanDisable: false, contextWindow: 512000, maxOutput: 131072 },
+    "z-ai/glm-5.2": { tools: false, reasoning: true, thinkingFormat: "openai", contextWindow: 200000, maxOutput: 128000 },
+    "deepseek-ai/deepseek-v4-pro": { tools: true, reasoning: true, thinkingFormat: "openai", contextWindow: 1000000, maxOutput: 65536 },
+    "deepseek-ai/deepseek-v4-flash": { tools: true, reasoning: true, thinkingFormat: "openai", contextWindow: 1000000, maxOutput: 65536 },
   },
   // glm-5.3-flash on OpenCode Go is served by a backend that rejects the z.ai
   // `thinking` object (400: unknown field "thinking") and wants reasoning_effort.
@@ -466,6 +479,14 @@ PROVIDER_CAPABILITIES.dv = PROVIDER_CAPABILITIES["devin-cli"];
 PROVIDER_CAPABILITIES.devin = PROVIDER_CAPABILITIES["devin-cli"];
 // The global mcode site serves the same catalog — share the capability table.
 PROVIDER_CAPABILITIES["minimax-code-global"] = PROVIDER_CAPABILITIES["minimax-code"];
+
+// SenseNova (Intl) chat models: 256K context, 64K output (upstream 0.5.119).
+const SENSENOVA_INTL_CHAT = { vision: true, reasoning: true, thinkingFormat: "openai", contextWindow: 262144, maxOutput: 65536 };
+PROVIDER_CAPABILITIES["sensenova-intl"] = {
+  "sensenova-6.8-flash": SENSENOVA_INTL_CHAT,
+  "sensenova-6.8-flash-lite": SENSENOVA_INTL_CHAT,
+  "sensenova-6.7-flash-lite": SENSENOVA_INTL_CHAT,
+};
 
 /**
  * Pattern fallback — glob (* = wildcard), matched case-insensitively and
@@ -716,12 +737,10 @@ export function aggregateComboCapabilities(comboModels, comboLookup = null, reso
 }
 
 /**
- * Resolve capabilities for a model using the 4-step fallback chain,
- * merged over DEFAULT_CAPABILITIES so the result is always complete.
- *
- * @param {string} provider
- * @param {string} model
- * @returns {object} full capabilities object
+ * Table resolution (resolveBaseCapabilities below): provider override →
+ * exact id → pattern → floor, merged over DEFAULT_CAPABILITIES, then
+ * refined by the synced catalog. User overrides are applied last by the
+ * exported getCapabilitiesForModel, not here.
  */
 const MODALITY_KEYS = ["vision", "pdf", "audioInput", "videoInput"];
 
@@ -748,6 +767,45 @@ export function setCatalogSource(source) {
 function getCatalogSource() {
   if (typeof globalThis === "undefined") return catalogSource;
   return globalThis.__9rCatalogSource || null;
+}
+
+// User model overrides — same install pattern as the catalog source: the
+// server pushes a reader in (src/lib/userModelCaps.js, which reads the
+// customModels kv), this module stays free of node:fs / DB imports because
+// the dashboard bundles it into the browser too. The slot lives on
+// globalThis for the same per-chunk module-state reason as the catalog one.
+let userCapsSource = null;
+
+/**
+ * Install the user-override reader (server only).
+ * @param {{ getOverride: (provider: string, model: string) => object|null } | null} source
+ */
+export function setUserCapsSource(source) {
+  userCapsSource = source;
+  if (typeof globalThis !== "undefined") globalThis.__9rUserCapsSource = source;
+}
+
+function getUserCapsSource() {
+  if (typeof globalThis === "undefined") return userCapsSource;
+  return globalThis.__9rUserCapsSource || null;
+}
+
+// Sparse user override, applied last over a resolved result: only the fields
+// the user actually set win (an absent key keeps the detected value), so an
+// override can turn vision on for a pattern-missed model without touching
+// the reasoning / thinking fields detection got right. Fail-open: a reader
+// that throws leaves detection untouched.
+function applyUserCapsOverride(resolved, provider, model) {
+  const source = getUserCapsSource();
+  if (!source) return resolved;
+  let override = null;
+  try {
+    override = source.getOverride(provider, model);
+  } catch {
+    return resolved;
+  }
+  if (!override || typeof override !== "object") return resolved;
+  return { ...resolved, ...override };
 }
 
 // Apply the synced catalog + name heuristic on top of a table-resolved result.
@@ -814,7 +872,23 @@ function isCommandCodeTextOnly(model) {
   }
   return false;
 }
-export function getCapabilitiesForModel(provider, model) {
+
+// Exact-id lookup, case-insensitive: registries serve mixed-case ids
+// ("dahl/zai-org/GLM-5.3-Flash") while the tables key the canonical
+// lowercase id ("glm-5.3-flash"). A case-sensitive miss falls through to a
+// generic pattern that lacks the model's vision/pdf flags, so the model is
+// silently advertised as text-only and images are stripped. Patterns stay
+// case-insensitive already (matchPattern); only the exact steps need this.
+function lookupExact(map, key) {
+  if (!map || !key) return undefined;
+  if (map[key] !== undefined) return map[key];
+  const lower = String(key).toLowerCase();
+  for (const k of Object.keys(map)) {
+    if (k.toLowerCase() === lower) return map[k];
+  }
+  return undefined;
+}
+function resolveBaseCapabilities(provider, model) {
   if (!model) return { ...DEFAULT_CAPABILITIES };
 
   // Canonical exact lookup strips vendor prefix: "anthropic/claude-opus-4.7" -> "claude-opus-4.7".
@@ -824,8 +898,8 @@ export function getCapabilitiesForModel(provider, model) {
   // (deepseek-v4 → thinkingFormat:deepseek, vision:false) must not win here.
   if (provider === "commandcode" || provider === "cmc") {
     const providerCaps = PROVIDER_CAPABILITIES.commandcode;
-    if (providerCaps?.[model]) return { ...DEFAULT_CAPABILITIES, ...providerCaps[model] };
-    if (providerCaps?.[baseModel]) return { ...DEFAULT_CAPABILITIES, ...providerCaps[baseModel] };
+    const hit = lookupExact(providerCaps, model) ?? lookupExact(providerCaps, baseModel);
+    if (hit) return { ...DEFAULT_CAPABILITIES, ...hit };
     return {
       ...DEFAULT_CAPABILITIES,
       reasoning: true,
@@ -840,14 +914,14 @@ export function getCapabilitiesForModel(provider, model) {
   // 1. Provider-specific override
   if (provider) {
     const providerCaps = PROVIDER_CAPABILITIES[provider];
-    if (providerCaps?.[model]) return { ...DEFAULT_CAPABILITIES, ...providerCaps[model] };
-    if (providerCaps?.[baseModel]) return { ...DEFAULT_CAPABILITIES, ...providerCaps[baseModel] };
+    const hit = lookupExact(providerCaps, model) ?? lookupExact(providerCaps, baseModel);
+    if (hit) return { ...DEFAULT_CAPABILITIES, ...hit };
   }
 
   // 2. Canonical exact, then catalog overlay so provider-scoped models.dev
   //    deltas still apply. Step 1 above still short-circuits.
-  if (MODEL_CAPABILITIES[baseModel]) return refine(MODEL_CAPABILITIES[baseModel], provider, model);
-  if (MODEL_CAPABILITIES[model]) return refine(MODEL_CAPABILITIES[model], provider, model);
+  const exact = lookupExact(MODEL_CAPABILITIES, baseModel) ?? lookupExact(MODEL_CAPABILITIES, model);
+  if (exact) return refine(exact, provider, model);
 
   // 3. Pattern match (first match wins), refined by catalog + name heuristic
   for (const { pattern, caps } of PATTERN_CAPABILITIES) {
@@ -858,6 +932,22 @@ export function getCapabilitiesForModel(provider, model) {
 
   // 4. Floor
   return refine(null, provider, model);
+}
+
+/**
+ * Resolve capabilities for a model using the 4-step fallback chain,
+ * merged over DEFAULT_CAPABILITIES so the result is always complete,
+ * then refined by the synced catalog — and finally by the user's own
+ * per-model overrides (model editor), which is what makes an override
+ * reach real requests: chatCore calls this function directly, so a
+ * vision:true override here is what stops the image strip.
+ *
+ * @param {string} provider
+ * @param {string} model
+ * @returns {object} full capabilities object
+ */
+export function getCapabilitiesForModel(provider, model) {
+  return applyUserCapsOverride(resolveBaseCapabilities(provider, model), provider, model);
 }
 
 // Gemini 4 (Argon) drops sampling params and requires functionResponse-last merged user turns.

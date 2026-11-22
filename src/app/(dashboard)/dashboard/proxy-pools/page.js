@@ -1,7 +1,8 @@
 "use client";
 
 import { useCallback, useEffect, useState, useRef } from "react";
-import { Badge, Button, Card, CardSkeleton, Input, Modal, Toggle, ConfirmModal } from "@/shared/components";
+import { Badge, Button, Card, CardSkeleton, Input, Modal, Toggle, ConfirmModal, SegmentedControl } from "@/shared/components";
+import { errorText } from "@/shared/utils/errorText";
 import Pagination from "@/shared/components/Pagination";
 import { useNotificationStore } from "@/store/notificationStore";
 
@@ -61,6 +62,7 @@ export default function ProxyPoolsPage() {
   const [failedCount, setFailedCount] = useState(0);
   const [searchQuery, setSearchQuery] = useState("");
   const [appliedSearch, setAppliedSearch] = useState("");
+  const [statusFilter, setStatusFilter] = useState("all");
   const [healthChecking, setHealthChecking] = useState(false);
   const [healthProgress, setHealthProgress] = useState({ current: 0, total: 0 });
   const [bulkBusy, setBulkBusy] = useState(false);
@@ -88,6 +90,7 @@ export default function ProxyPoolsPage() {
         pageSize: String(pageSize),
       });
       if (appliedSearch) params.set("search", appliedSearch);
+      if (statusFilter !== "all") params.set("status", statusFilter);
       const res = await fetch(`/api/proxy-pools?${params}`, { cache: "no-store" });
       const data = await res.json();
       if (res.ok) {
@@ -105,7 +108,7 @@ export default function ProxyPoolsPage() {
     } finally {
       setLoading(false);
     }
-  }, [page, pageSize, appliedSearch]);
+  }, [page, pageSize, appliedSearch, statusFilter]);
 
   useEffect(() => {
     fetchProxyPools();
@@ -260,6 +263,7 @@ export default function ProxyPoolsPage() {
       try {
         const params = new URLSearchParams({ idsOnly: "true" });
         if (appliedSearch) params.set("search", appliedSearch);
+        if (statusFilter !== "all") params.set("status", statusFilter);
         const res = await fetch(`/api/proxy-pools?${params}`, { cache: "no-store" });
         const data = await res.json();
         targets = res.ok ? (data.ids || []) : [];
@@ -330,7 +334,7 @@ export default function ProxyPoolsPage() {
       const res = await fetch("/api/proxy-pools/delete-failed", { method: "POST" });
       const data = await res.json();
       if (!res.ok) {
-        notify.error(data.error || "Failed to delete failed proxies");
+        notify.error(errorText(data, "Failed to delete failed proxies"));
         return;
       }
       await fetchProxyPools();
@@ -413,6 +417,52 @@ export default function ProxyPoolsPage() {
     if (count === 0) return;
     confirmDeleteFailed(count, `Delete ${count} proxies that failed their last test? Pools still bound to a connection are kept.`);
   };
+
+  const runDeleteAll = useCallback(async () => {
+    setBulkBusy(true);
+    try {
+      const res = await fetch("/api/proxy-pools/delete-all", { method: "POST" });
+      const data = await res.json();
+      if (!res.ok) {
+        notify.error(errorText(data, "Failed to delete all proxies"));
+        return;
+      }
+      await fetchProxyPools();
+      clearSelection();
+      notify.success(`Deleted ${data.deletedPools} proxy pools, ${data.unpinnedConnections} connection(s) switched to DIRECT`);
+    } catch {
+      notify.error("Failed to delete all proxies");
+    } finally {
+      setBulkBusy(false);
+    }
+  }, [fetchProxyPools, notify]);
+
+  // Delete-all confirm: fetch the live counts first (pools + bound
+  // connections) so the modal states exactly what will be destroyed.
+  // idsOnly keeps the response light — no pool rows are downloaded.
+  const handleDeleteAll = useCallback(async () => {
+    if (total === 0) return;
+    setBulkBusy(true);
+    try {
+      const res = await fetch("/api/proxy-pools?idsOnly=true&includeUsage=true", { cache: "no-store" });
+      const data = await res.json();
+      const poolCount = res.ok ? (data.total ?? 0) : total;
+      const boundCount = res.ok ? (data.boundConnectionCount ?? 0) : 0;
+      setConfirmState({
+        title: "Delete All Proxy Pools",
+        message: `Delete all ${poolCount} proxy pool(s)? ${boundCount} connection(s) are currently using a pool and will be switched back to DIRECT (no proxy). This cannot be undone.`,
+        confirmText: "Delete all",
+        onConfirm: async () => {
+          setConfirmState(null);
+          await runDeleteAll();
+        },
+      });
+    } catch {
+      notify.error("Failed to load proxy counts");
+    } finally {
+      setBulkBusy(false);
+    }
+  }, [total, runDeleteAll, notify]);
 
   // Resume watching if a health-check job is already running (e.g. it was
   // started before a page refresh).
@@ -560,7 +610,7 @@ export default function ProxyPoolsPage() {
         closeVercelModal();
         notify.success(`Deployed: ${data.deployUrl}`);
       } else {
-        notify.error(data.error || "Deploy failed");
+        notify.error(errorText(data, "Deploy failed"));
       }
     } catch (error) {
       console.log("Error deploying Vercel relay:", error);
@@ -585,7 +635,7 @@ export default function ProxyPoolsPage() {
         closeCloudflareModal();
         notify.success(`Deployed: ${data.deployUrl}`);
       } else {
-        notify.error(data.error || "Deploy failed");
+        notify.error(errorText(data, "Deploy failed"));
       }
     } catch (error) {
       console.log("Error deploying Cloudflare relay:", error);
@@ -610,7 +660,7 @@ export default function ProxyPoolsPage() {
         closeDenoModal();
         notify.success(`Deployed: ${data.deployUrl}`);
       } else {
-        notify.error(data.error || "Deploy failed");
+        notify.error(errorText(data, "Deploy failed"));
       }
     } catch (error) {
       console.log("Error deploying Deno relay:", error);
@@ -635,7 +685,7 @@ export default function ProxyPoolsPage() {
         closeNetlifyModal();
         notify.success(`Deployed: ${data.deployUrl}`);
       } else {
-        notify.error(data.error || "Deploy failed");
+        notify.error(errorText(data, "Deploy failed"));
       }
     } catch (error) {
       console.log("Error deploying Netlify relay:", error);
@@ -852,6 +902,17 @@ export default function ProxyPoolsPage() {
             onChange={(e) => setSearchQuery(e.target.value)}
             className="min-w-[12rem] flex-1 sm:flex-none sm:w-64"
           />
+          <SegmentedControl
+            options={[
+              { value: "all", label: "All" },
+              { value: "active", label: "Active" },
+              { value: "inactive", label: "Inactive" },
+              { value: "failed", label: "Failed" },
+            ]}
+            value={statusFilter}
+            onChange={(v) => { setStatusFilter(v); setPage(1); }}
+            size="sm"
+          />
           {total > 0 && (
             <label className="flex items-center gap-1.5 text-xs text-text-muted cursor-pointer">
               <input
@@ -885,6 +946,9 @@ export default function ProxyPoolsPage() {
                 Delete failed ({failedCount})
               </Button>
             )}
+            <Button size="sm" variant="danger" icon="delete_forever" onClick={handleDeleteAll} disabled={bulkBusy || healthChecking || total === 0}>
+              Delete all
+            </Button>
           </div>
         </div>
 
@@ -917,7 +981,7 @@ export default function ProxyPoolsPage() {
 
         {proxyPools.length === 0 ? (
           <div className="text-center py-10">
-            <p className="text-text-main font-medium mb-1">{appliedSearch ? `No pools match "${appliedSearch}"` : "No proxy pool entries yet"}</p>
+            <p className="text-text-main font-medium mb-1">{appliedSearch ? `No pools match "${appliedSearch}"` : statusFilter !== "all" ? `No ${statusFilter} pools` : "No proxy pool entries yet"}</p>
             <p className="text-sm text-text-muted mb-4">
               {appliedSearch ? "Try a different search." : "Create a proxy pool entry, then assign it to connections."}
             </p>
@@ -1391,6 +1455,7 @@ export default function ProxyPoolsPage() {
         onConfirm={confirmState?.onConfirm}
         title={confirmState?.title || "Confirm"}
         message={confirmState?.message}
+        confirmText={confirmState?.confirmText || "Confirm"}
         variant="danger"
       />
     </div>

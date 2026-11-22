@@ -230,13 +230,20 @@ function convertToolResultContent(content) {
 // Get content blocks from single message
 function getContentBlocksFromMessage(msg, toolNameMap = new Map()) {
   const blocks = [];
+  // A client's cache_control rides on the block that carries it (position
+  // and value); prepareClaudeRequest preserves message markers in place, so
+  // carrying them here is what lets an OpenAI-shaped client cache a repeat
+  // prompt on a Claude-format provider. Thinking blocks are the exception:
+  // cache_control is invalid on them and is stripped below, as before.
+  const withCache = (block, source) =>
+    source?.cache_control ? { ...block, cache_control: { ...source.cache_control } } : block;
 
   if (msg.role === ROLE.TOOL) {
-    blocks.push({
+    blocks.push(withCache({
       type: CLAUDE_BLOCK.TOOL_RESULT,
       tool_use_id: msg.tool_call_id,
       content: convertToolResultContent(msg.content)
-    });
+    }, msg));
   } else if (msg.role === ROLE.USER) {
     if (typeof msg.content === "string") {
       if (msg.content) {
@@ -245,30 +252,30 @@ function getContentBlocksFromMessage(msg, toolNameMap = new Map()) {
     } else if (Array.isArray(msg.content)) {
       for (const part of msg.content) {
         if (part.type === OPENAI_BLOCK.TEXT && part.text) {
-          blocks.push({ type: CLAUDE_BLOCK.TEXT, text: part.text });
+          blocks.push(withCache({ type: CLAUDE_BLOCK.TEXT, text: part.text }, part));
         } else if (part.type === CLAUDE_BLOCK.TOOL_RESULT) {
-          blocks.push({
+          blocks.push(withCache({
             type: CLAUDE_BLOCK.TOOL_RESULT,
             tool_use_id: part.tool_use_id,
             content: part.content,
             ...(part.is_error && { is_error: part.is_error })
-          });
+          }, part));
         } else if (part.type === OPENAI_BLOCK.IMAGE_URL) {
           const url = part.image_url.url;
           const parsed = parseDataUri(url);
           if (parsed) {
-            blocks.push({
+            blocks.push(withCache({
               type: CLAUDE_BLOCK.IMAGE,
               source: { type: "base64", media_type: parsed.mimeType, data: parsed.base64 }
-            });
+            }, part));
           } else if (url.startsWith("http://") || url.startsWith("https://")) {
-            blocks.push({
+            blocks.push(withCache({
               type: CLAUDE_BLOCK.IMAGE,
               source: { type: "url", url }
-            });
+            }, part));
           }
         } else if (part.type === OPENAI_BLOCK.IMAGE && part.source) {
-          blocks.push({ type: CLAUDE_BLOCK.IMAGE, source: part.source });
+          blocks.push(withCache({ type: CLAUDE_BLOCK.IMAGE, source: part.source }, part));
         } else if (part.type === OPENAI_BLOCK.FILE && part.file) {
           // OpenAI file block -> Claude document (PDF only; Claude rejects other mimes).
           const fileData = part.file.file_data;
@@ -283,13 +290,25 @@ function getContentBlocksFromMessage(msg, toolNameMap = new Map()) {
       }
     }
   } else if (msg.role === ROLE.ASSISTANT) {
+    // DeepSeek-style reasoning carried on the message itself becomes a Claude
+    // thinking block, so the reasoning survives the OpenAI→Claude leg instead
+    // of being silently dropped. Provider-awareness lives downstream in
+    // prepareClaudeRequest: native Anthropic drops unsigned blocks, compatible
+    // providers get the default signature, DeepSeek keeps them as-is.
+    const hasThinkingBlock = Array.isArray(msg.content) && msg.content.some(
+      (p) => p?.type === CLAUDE_BLOCK.THINKING || p?.type === CLAUDE_BLOCK.REDACTED_THINKING
+    );
+    if (!hasThinkingBlock && typeof msg.reasoning_content === "string" && msg.reasoning_content.trim()) {
+      blocks.push({ type: CLAUDE_BLOCK.THINKING, thinking: msg.reasoning_content });
+    }
+
     if (Array.isArray(msg.content)) {
       for (const part of msg.content) {
         if (part.type === OPENAI_BLOCK.TEXT && part.text) {
-          blocks.push({ type: CLAUDE_BLOCK.TEXT, text: part.text });
+          blocks.push(withCache({ type: CLAUDE_BLOCK.TEXT, text: part.text }, part));
         } else if (part.type === CLAUDE_BLOCK.TOOL_USE) {
           // Tool name already has prefix from tool declarations, keep as-is
-          blocks.push({ type: CLAUDE_BLOCK.TOOL_USE, id: part.id, name: part.name, input: part.input });
+          blocks.push(withCache({ type: CLAUDE_BLOCK.TOOL_USE, id: part.id, name: part.name, input: part.input }, part));
         } else if (part.type === CLAUDE_BLOCK.THINKING) {
           // Include thinking block but strip cache_control (not allowed on thinking blocks)
           const { cache_control, ...thinkingBlock } = part;

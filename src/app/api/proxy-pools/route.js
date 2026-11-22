@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { createProxyPool, getProviderConnections, getProxyPools } from "@/models";
+import { createProxyPool, getProviderConnections, getProxyPools, validateProxyUrl } from "@/models";
 
 function toBoolean(value) {
   if (value === "true") return true;
@@ -25,6 +25,11 @@ function normalizeProxyPoolInput(body = {}) {
     return { error: "Proxy URL is required" };
   }
 
+  const schemeError = validateProxyUrl(proxyUrl);
+  if (schemeError) {
+    return { error: schemeError };
+  }
+
   return { name, proxyUrl, noProxy, isActive, strictProxy, type };
 }
 
@@ -45,6 +50,9 @@ function buildUsageMap(connections = []) {
 // No page/pageSize params → legacy full list (used by provider pickers).
 // With page/pageSize → one page + total/activeCount/failedCount.
 // ?search= filters by pool name (case-insensitive substring).
+// ?status=active|inactive|failed narrows to that pool status (all = no filter).
+// activeCount/failedCount are global (pre-filter) so the toolbar badges stay
+// meaningful while a search or status filter narrows the list itself.
 // ?idsOnly=1 returns just { ids, total } for the current filter+search
 // (bulk actions that target "all pools" without downloading every row).
 export async function GET(request) {
@@ -54,6 +62,8 @@ export async function GET(request) {
     const includeUsage = searchParams.get("includeUsage") === "true";
     const idsOnly = searchParams.get("idsOnly") === "true";
     const search = (searchParams.get("search") || "").trim().toLowerCase();
+    const statusRaw = searchParams.get("status") || "";
+    const status = ["active", "inactive", "failed"].includes(statusRaw) ? statusRaw : null;
     const hasPage = searchParams.has("page") || searchParams.has("pageSize");
     const page = Math.max(1, Number.parseInt(searchParams.get("page") || "1", 10) || 1);
     const pageSizeRaw = Number.parseInt(searchParams.get("pageSize") || "", 10);
@@ -65,11 +75,31 @@ export async function GET(request) {
     }
 
     let proxyPools = await getProxyPools(filter);
+    // Global counts, before the search/status narrowing below.
+    const activeCount = proxyPools.filter((pool) => pool.isActive === true).length;
+    const failedCount = proxyPools.filter((pool) => pool.testStatus === "error").length;
     if (search) {
       proxyPools = proxyPools.filter((pool) => (pool.name || "").toLowerCase().includes(search));
     }
+    if (status === "active") {
+      proxyPools = proxyPools.filter((pool) => pool.isActive === true);
+    } else if (status === "inactive") {
+      proxyPools = proxyPools.filter((pool) => pool.isActive !== true);
+    } else if (status === "failed") {
+      proxyPools = proxyPools.filter((pool) => pool.testStatus === "error");
+    }
 
     if (idsOnly) {
+      // With includeUsage, also report how many connections are currently
+      // bound to any pool — the delete-all confirm dialog needs that count
+      // without downloading every row. The sum covers dangling bindings too
+      // (a connection whose pool id no longer exists still gets unpinned).
+      if (includeUsage) {
+        const connections = await getProviderConnections();
+        const usageMap = buildUsageMap(connections);
+        const boundConnectionCount = [...usageMap.values()].reduce((a, b) => a + b, 0);
+        return NextResponse.json({ ids: proxyPools.map((pool) => pool.id), total: proxyPools.length, boundConnectionCount });
+      }
       return NextResponse.json({ ids: proxyPools.map((pool) => pool.id), total: proxyPools.length });
     }
 
@@ -90,8 +120,6 @@ export async function GET(request) {
     }
 
     const total = proxyPools.length;
-    const activeCount = proxyPools.filter((pool) => pool.isActive === true).length;
-    const failedCount = proxyPools.filter((pool) => pool.testStatus === "error").length;
     const start = (page - 1) * pageSize;
     let pagePools = proxyPools.slice(start, start + pageSize);
 

@@ -10,14 +10,15 @@
 // opt12: the editor also runs in draft mode inside the unified Edit modal
 // (draft=true): every change only updates the parent draft — nothing is
 // saved until Save. In immediate mode the callbacks PUT straight away.
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import PropTypes from "prop-types";
 import { Toggle, ModelSelectModal } from "@/shared/components";
 
 const QUOTA_WINDOWS = [
-  { hours: 24, label: "24 hours" },
-  { hours: 168, label: "7 days" },
-  { hours: 720, label: "30 days" },
+  // PATCH-ABCE (2026-11-19): quota is all-time (lifetime) only — the mode
+  // is carried by `absolute: true`, so the dropdown keeps a single
+  // "All time" option whose value (24) is only a formal representation.
+  { hours: 24, label: "All time" },
 ];
 
 // 9Router Pro: per-key rate limits (for reselling). Empty field = unlimited.
@@ -101,7 +102,7 @@ export function KeyAccessSummary({ apiKey }) {
 KeyAccessSummary.propTypes = {
   apiKey: PropTypes.shape({
     access: PropTypes.shape({ restricted: PropTypes.bool, allow: PropTypes.arrayOf(PropTypes.string) }),
-    quota: PropTypes.shape({ enabled: PropTypes.bool, limit: PropTypes.number, windowHours: PropTypes.number }),
+    quota: PropTypes.shape({ enabled: PropTypes.bool, limit: PropTypes.number, windowHours: PropTypes.number, costLimit: PropTypes.number, resetAt: PropTypes.string, absolute: PropTypes.bool }),
     quotaUsed: PropTypes.number,
     limits: PropTypes.shape({
       rpm: PropTypes.number, tpm: PropTypes.number, rph: PropTypes.number,
@@ -115,7 +116,51 @@ export default function KeyAccessControls({ apiKey, onChange, onRequestRestrict,
   const quota = apiKey.quota || null;
   const quotaUsed = apiKey.quotaUsed || 0;
   const limits = apiKey.limits || null;
-  const limitsUsage = apiKey.limitsUsage || null;
+
+  // Live usage is read-only display: it starts from the list snapshot and
+  // refreshes from GET /api/keys/[id] while the panel is open. The list GET
+  // runs once on page load, so without this the "Live:" line froze at
+  // page-load values even while the key was serving traffic.
+  const [liveUsage, setLiveUsage] = useState(apiKey.limitsUsage || null);
+  // All state above the effects: the live-usage effect reads `open` in its
+  // dependency array, and deps are evaluated during render — declaring `open`
+  // below the effect threw "Cannot access 'open' before initialization" on
+  // every Edit-modal open and crashed the whole page (TDZ bug).
+  const [open, setOpen] = useState(false);
+  const [limitDraft, setLimitDraft] = useState("");
+  const [pickerOpen, setPickerOpen] = useState(false);
+  // PATCH-ABCE: pending reset — the Reset button only marks the counter
+  // as 0 in the display (and puts resetAt in the draft); the real value
+  // is sent on Save (draft) or PUT (immediate) so it can be cancelled.
+  // Clears when a different key is shown.
+  const [pendingReset, setPendingReset] = useState(false);
+  useEffect(() => { setPendingReset(false); }, [apiKey.id]);
+  const [activeProviders, setActiveProviders] = useState([]);
+  const [modelAliases, setModelAliases] = useState({});
+  useEffect(() => {
+    setLiveUsage(apiKey.limitsUsage || null);
+  }, [apiKey.limitsUsage]);
+  useEffect(() => {
+    if (!open && !draft) return undefined;
+    let cancelled = false;
+    const refresh = async () => {
+      if (document.hidden) return;
+      try {
+        const res = await fetch(`/api/keys/${apiKey.id}`);
+        if (!res.ok || cancelled) return;
+        const data = await res.json();
+        if (data?.key?.limitsUsage) setLiveUsage(data.key.limitsUsage);
+      } catch {
+        // Keep the last value; the next tick retries.
+      }
+    };
+    refresh();
+    const timer = setInterval(refresh, 3000);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [open, draft, apiKey.id]);
 
   // opt12 draft mode: every change only updates the parent draft (nothing
   // is saved until Save). In immediate mode the callbacks PUT straight
@@ -127,12 +172,6 @@ export default function KeyAccessControls({ apiKey, onChange, onRequestRestrict,
   const emitRestrict = () => (draft
     ? onDraftChange?.({ access: { restricted: true, allow: access.allow || [] } })
     : onRequestRestrict?.());
-
-  const [open, setOpen] = useState(false);
-  const [limitDraft, setLimitDraft] = useState("");
-  const [pickerOpen, setPickerOpen] = useState(false);
-  const [activeProviders, setActiveProviders] = useState([]);
-  const [modelAliases, setModelAliases] = useState({});
 
   const commitLimit = (field, rawValue) => {
     if (!draft && !onLimitsChange) return;
@@ -167,7 +206,10 @@ export default function KeyAccessControls({ apiKey, onChange, onRequestRestrict,
   };
   const remove = (value) => setAllow(access.allow.filter((e) => e !== value));
 
-  const quotaOver = !!quota?.enabled && quotaUsed >= quota.limit;
+  // Display usage: while a reset is pending the counter reads 0 (the
+  // server still holds the old value until Save/PUT lands it).
+  const displayUsed = pendingReset ? 0 : quotaUsed;
+  const quotaOver = !!quota?.enabled && displayUsed >= quota.limit;
   const limitsText = limitsSummary(limits);
 
   return (
@@ -248,7 +290,7 @@ export default function KeyAccessControls({ apiKey, onChange, onRequestRestrict,
                     if (!draft && !onQuotaChange) return;
                     if (checked) {
                       const limit = parseInt(limitDraft, 10) || quota?.limit || 100000;
-                      emitQuota({ ...quota, enabled: true, limit, windowHours: quota?.windowHours || 24 });
+                      emitQuota({ ...quota, enabled: true, limit, windowHours: 24, absolute: true });
                     } else if (quota) {
                       emitQuota({ ...quota, enabled: false });
                     }
@@ -273,24 +315,36 @@ export default function KeyAccessControls({ apiKey, onChange, onRequestRestrict,
                     }}
                     onChange={(e) => setLimitDraft(e.target.value)}
                   />
-                  <span className="text-xs text-text-muted">tokens per</span>
+                  <span className="text-xs text-text-muted">tokens (all time)</span>
                   <select
                     className="rounded-lg border border-border bg-bg px-2 py-1.5 text-xs text-text-main outline-none transition-colors focus:border-brand-500"
                     value={quota.windowHours}
-                    onChange={(e) => emitQuota({ ...quota, windowHours: Number(e.target.value) })}
+                    onChange={(e) => emitQuota({ ...quota, windowHours: Number(e.target.value), absolute: true })}
                   >
                     {QUOTA_WINDOWS.map((w) => (
                       <option key={w.hours} value={w.hours}>{w.label}</option>
                     ))}
                   </select>
                   <span className={`ml-auto text-xs tabular-nums ${quotaOver ? "font-medium text-red-500" : "text-text-muted"}`}>
-                    {fmt(quotaUsed)} / {fmt(quota.limit)} used
+                    {fmt(displayUsed)} / {fmt(quota.limit)} used
                   </span>
+                  <button
+                    type="button"
+                    title="Reset usage counter to zero (history is kept)"
+                    onClick={() => {
+                      if (!draft && !onQuotaChange) return;
+                      setPendingReset(true);
+                      emitQuota({ ...quota, resetAt: new Date().toISOString() });
+                    }}
+                    className="rounded-md border border-border px-2 py-1 text-[11px] text-text-muted hover:border-brand-500 hover:text-brand-500"
+                  >
+                    Reset usage
+                  </button>
                 </div>
                 <div className="mt-2 h-1 overflow-hidden rounded-full bg-black/10 dark:bg-white/10">
                   <div
                     className={`h-full rounded-full transition-all ${quotaOver ? "bg-red-500" : "bg-brand-500"}`}
-                    style={{ width: `${Math.min(100, quota.limit ? (quotaUsed / quota.limit) * 100 : 0)}%` }}
+                    style={{ width: `${Math.min(100, quota.limit ? (displayUsed / quota.limit) * 100 : 0)}%` }}
                   />
                 </div>
                 <div className="mt-2.5 flex flex-wrap items-center gap-2">
@@ -349,14 +403,14 @@ export default function KeyAccessControls({ apiKey, onChange, onRequestRestrict,
                 </label>
               ))}
             </div>
-            {!!limitsUsage && (
+            {!!liveUsage && (
               <p className="mt-2.5 flex items-center gap-1.5 text-[11px] tabular-nums text-text-muted">
                 <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" />
-                Live: {limitsUsage.rpmUsed || 0} req/min
-                {limits?.tpm ? ` · ${fmt(limitsUsage.tpmUsed)} tok/min` : ""}
-                {limits?.rph ? ` · ${fmt(limitsUsage.rphUsed)} req/hour` : ""}
-                {limits?.rpd ? ` · ${fmt(limitsUsage.rpdUsed)} req/day` : ""}
-                {" · "}{limitsUsage.inFlight || 0} in flight
+                Live: {liveUsage.rpmUsed || 0} req/min
+                {limits?.tpm ? ` · ${fmt(liveUsage.tpmUsed)} tok/min` : ""}
+                {limits?.rph ? ` · ${fmt(liveUsage.rphUsed)} req/hour` : ""}
+                {limits?.rpd ? ` · ${fmt(liveUsage.rpdUsed)} req/day` : ""}
+                {" · "}{liveUsage.inFlight || 0} in flight
               </p>
             )}
           </div>
@@ -423,7 +477,7 @@ KeyAccessControls.propTypes = {
     name: PropTypes.string,
     expiresAt: PropTypes.string,
     access: PropTypes.shape({ restricted: PropTypes.bool, allow: PropTypes.arrayOf(PropTypes.string) }),
-    quota: PropTypes.shape({ enabled: PropTypes.bool, limit: PropTypes.number, windowHours: PropTypes.number }),
+    quota: PropTypes.shape({ enabled: PropTypes.bool, limit: PropTypes.number, windowHours: PropTypes.number, costLimit: PropTypes.number, resetAt: PropTypes.string, absolute: PropTypes.bool }),
     quotaUsed: PropTypes.number,
     limits: PropTypes.shape({
       rpm: PropTypes.number, tpm: PropTypes.number, rph: PropTypes.number,

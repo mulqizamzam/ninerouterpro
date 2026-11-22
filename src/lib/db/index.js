@@ -56,6 +56,7 @@ export {
 export {
   getProxyPools, getProxyPoolById,
   createProxyPool, updateProxyPool, deleteProxyPool,
+  validateProxyUrl,
 } from "./repos/proxyPoolsRepo.js";
 
 // API keys
@@ -67,6 +68,7 @@ export {
 export {
   getCombos, getComboById, getComboByName,
   createCombo, updateCombo, deleteCombo,
+  COMBO_CONTEXT_WINDOW_MODES, cleanComboContextWindow, resolveComboContextWindow,
 } from "./repos/combosRepo.js";
 
 // Aliases (model + custom + mitm)
@@ -82,7 +84,7 @@ export {
   getInjectUserPrompts, setInjectUserPrompt, deleteInjectUserPrompt,
   getInjectKeyModelPrompts, setInjectKeyModelPrompt, deleteInjectKeyModelPrompt,
   getInjectVariants, setInjectVariant, deleteInjectVariant, migrateModelPromptsToVariants, isReservedVariantName,
-  getInjectGlobal, setInjectGlobal, resolvePromptInjections, resolvePromptInjectionMeta, resolveVariantSampling, applyVariantSampling, cleanSamplingParams,
+  getInjectGlobal, setInjectGlobal, resolvePromptInjections, resolvePromptInjectionMeta, resolveVariantSampling, applyVariantSampling, cleanSamplingParams, cleanEntry,
   getPromptTemplates, upsertPromptTemplate, deletePromptTemplate,
 } from "./repos/promptInjectRepo.js";
 
@@ -90,6 +92,7 @@ export {
 export {
   getKeyQuota, getAllKeyQuotas, setKeyQuota, deleteKeyQuota,
   getKeyUsageInWindow, getKeyCostInWindow, checkKeyQuota,
+  resetKeyQuota, isLifetimeQuota,
 } from "./repos/keyQuotaRepo.js";
 
 // Key Limits (9Router Pro) — per-key RPM/TPM/RPH/RPD/concurrency config

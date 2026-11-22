@@ -265,10 +265,11 @@ describe("getCapabilitiesForModel — codebuddy-cn provider overrides", () => {
     expect(haiku55.contextWindow).toBe(1000000);
     expect(haiku55.maxOutput).toBe(128000);
 
-    // The override is provider-scoped: the global haiku pattern (claude-budget) still
-    // governs every other provider, including the bare/anthropic lookup.
-    expect(getCapabilitiesForModel(undefined, "claude-haiku-5-5").thinkingFormat).toBe("claude-budget");
-    expect(getCapabilitiesForModel("claude", "claude-haiku-5-5").thinkingFormat).toBe("claude-budget");
+    // Upstream 0.5.119 made haiku-5-5 adaptive-only GLOBALLY (explicit caps
+    // row), so the global lookup is adaptive on every provider now; only
+    // other haiku ids still fall through to the budget pattern.
+    expect(getCapabilitiesForModel(undefined, "claude-haiku-5-5").thinkingFormat).toBe("claude-adaptive");
+    expect(getCapabilitiesForModel("claude", "claude-haiku-5-5").thinkingFormat).toBe("claude-adaptive");
     expect(getCapabilitiesForModel("opencode-go", "claude-haiku-4-5-20251001").thinkingFormat).toBe("claude-budget");
   });
 
@@ -307,6 +308,24 @@ describe("OpenCode Free ids newer than the capability tables", () => {
       contextWindow: 1048576,
       maxOutput: 524288,
     });
+  });
+
+  it("resolves mixed-case vendor ids to the canonical exact entry (vision/pdf survive)", () => {
+    // dahl serves GLM-5.3-Flash mixed-case; the exact entry is lowercase.
+    // A case-sensitive miss used to fall through to the *glm-5* pattern (no
+    // vision), so the vision model was advertised as text-only and images
+    // were silently stripped.
+    expect(getCapabilitiesForModel("dahl", "zai-org/GLM-5.3-Flash")).toMatchObject({
+      vision: true,
+      pdf: true,
+      reasoning: true,
+      thinkingFormat: "zai",
+      contextWindow: 1000000,
+    });
+    expect(getCapabilitiesForModel("dahl", "glm-5.3-flash")).toMatchObject({ vision: true, pdf: true });
+    // Provider-override exact ids are case-insensitive too.
+    expect(getCapabilitiesForModel("opencode-go", "GLM-5.3-FLASH").thinkingFormat).toBe("openai");
+    expect(getCapabilitiesForModel("opencode-go", "glm-5.3-flash").thinkingFormat).toBe("openai");
   });
 
   it("keeps per-id modalities and limits instead of a generic floor", () => {

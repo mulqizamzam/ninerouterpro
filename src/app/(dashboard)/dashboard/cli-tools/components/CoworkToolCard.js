@@ -1,7 +1,9 @@
 "use client";
 
 import { useState, useEffect } from "react";
+import { createPortal } from "react-dom";
 import { Card, Button, ManualConfigModal, ComboFormModal, McpMarketplaceModal, ModelSelectModal } from "@/shared/components";
+import { errorText } from "@/shared/utils/errorText";
 import Image from "next/image";
 import BaseUrlSelect from "./BaseUrlSelect";
 import { rememberEndpoint } from "./cliEndpointPresets";
@@ -156,7 +158,7 @@ export default function CoworkToolCard({
         setMessage({ type: "success", text: "Settings applied. Quit & reopen Claude Desktop to load." });
         checkStatus();
       } else {
-        setMessage({ type: "error", text: data.error || "Failed to apply settings" });
+        setMessage({ type: "error", text: errorText(data, "Failed to apply settings") });
       }
     } catch (error) {
       setMessage({ type: "error", text: error.message });
@@ -212,7 +214,7 @@ export default function CoworkToolCard({
         setCustomPlugins([]);
         checkStatus();
       } else {
-        setMessage({ type: "error", text: data.error || "Failed to reset" });
+        setMessage({ type: "error", text: errorText(data, "Failed to reset") });
       }
     } catch (error) {
       setMessage({ type: "error", text: error.message });
@@ -553,8 +555,8 @@ export default function CoworkToolCard({
         addedNames={plugins.map((p) => p.name)}
       />
 
-      {/* Add Custom MCP modal */}
-      {addMcpOpen && (
+      {/* Add Custom MCP modal — portaled to document.body (see Modal.js) */}
+      {addMcpOpen && createPortal(
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40" onClick={() => setAddMcpOpen(false)}>
           <div className="bg-surface border border-border rounded-xl shadow-xl w-full max-w-sm mx-4 p-5 flex flex-col gap-4" onClick={(e) => e.stopPropagation()}>
             <div className="flex items-center justify-between">
@@ -600,7 +602,8 @@ export default function CoworkToolCard({
               >Add</button>
             </div>
           </div>
-        </div>
+        </div>,
+        document.body
       )}
     </Card>
   );

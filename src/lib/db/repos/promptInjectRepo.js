@@ -8,7 +8,10 @@
 //   · MODEL+KEY  — key "byKeyModel": { [apiKeyId]: { [modelName]: entry } }
 // Every coordinate owns exactly ONE injection (saving replaces it). A
 // request stacks its matches least → most specific:
-//   global → key → variant → model+key.
+//   global → key → combo → variant → model+key.
+// A combo's prompt (stored on the combo row, issue #2) fires for every
+// member of that combo, including variant members, before the variant's
+// own prompt — so one prompt steers the whole fallback chain.
 //
 // A VARIANT is a custom-named model: a name the user picks (e.g.
 // "dahlunce") backed by exactly one provider/model. Picking the variant
@@ -80,7 +83,7 @@ function cleanTurns(raw) {
   return out;
 }
 
-function cleanEntry(raw) {
+export function cleanEntry(raw) {
   if (!raw || typeof raw !== "object") return null;
   const base = {
     position: raw.position === "prepend" ? "prepend" : "append",
@@ -278,7 +281,11 @@ export function isReservedVariantName(raw) {
 function cleanVariantEntry(raw) {
   if (!raw || typeof raw !== "object") return null;
   const backing = typeof raw.model === "string" ? raw.model.trim() : "";
-  if (!backing.includes("/")) return null;
+  // PATCH-ABCE (C): a backing may be a combo name (no "/") as well as a
+  // provider/model. Whether a bare name is a real combo is checked in
+  // setInjectVariant (it has DB access); this pure cleaner only rejects
+  // an empty backing.
+  if (!backing) return null;
   const entry = cleanEntry(raw);
   if (!entry) return null;
   const out = {
@@ -361,6 +368,13 @@ export async function setInjectVariant(name, input = {}) {
   const nodes = await getProviderNodes().catch(() => []);
   const routedModel = resolveRoutableBacking(entry.model, nodes);
   if (routedModel === null) return null;
+  // PATCH-ABCE (C): a bare backing (no "/") must name an existing combo —
+  // otherwise it is a typo that would 404 at runtime. Combo names pass
+  // through resolveRoutableBacking unchanged.
+  if (!routedModel.includes("/")) {
+    const combo = await getComboByName(routedModel).catch(() => null);
+    if (!combo) return null;
+  }
   const routedEntry = routedModel === entry.model ? entry : { ...entry, model: routedModel };
   // No backing combo: a variant name routes directly (dispatch checks the
   // variants map), so saving a variant creates no combo object — the
@@ -612,11 +626,15 @@ export async function deletePromptTemplate(id) {
 // --------------------------------------------------------------- resolver
 
 // Pure selection — exported for tests. Stacked least → most specific:
-// global → key → variant → model+key. Per model scope, exactly one key
+// global → key → combo → variant → model+key. Per model scope, exactly one key
 // matches: the resolved "provider/model" — unless the user picked a
 // variant by its bare name, in which case the variant matches instead
 // and the model scopes stay silent (a variant pick is a different model
 // identity). Combo names never match.
+// The combo layer (issue #2): a combo's own prompt, passed by the caller
+// as ctx.comboPrompt (the combo's entry, cleaned here) with ctx.comboName.
+// It fires for EVERY member — including variant members, prepended before
+// the variant's own prompt — so one prompt steers the whole fallback chain.
 // The detailed form also reports isVariantPick: whether the stack's
 // model-scope entry (if any) came from the variant branch. The counter
 // MUST use this flag — never infer the pick from the requested name's
@@ -634,6 +652,13 @@ export function selectPromptInjectionsDetailed({ global, byKey, byModel, byKeyMo
 
   if (ctx.apiKeyId) {
     push("user", cleanMap(byKey)[ctx.apiKeyId]);
+  }
+
+  // Combo prompt: after the key's, before the variant's. A disabled or
+  // empty entry cleans to null / is skipped by push, so the stack stays
+  // byte-identical when no combo prompt is set.
+  if (ctx.comboPrompt) {
+    push(`combo:${ctx.comboName || "combo"}`, cleanEntry(ctx.comboPrompt));
   }
 
   // A bare requested name (no "/") is a variant pick: its prompt fires

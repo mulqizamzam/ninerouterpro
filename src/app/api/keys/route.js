@@ -5,6 +5,8 @@ import { recordQuotaPressure } from "@/lib/trustEvents.js";
 import { getKeyLimitUsage } from "@/lib/keyRateLimiter.js";
 import { getConsistentMachineId } from "@/shared/utils/machineId";
 import { validateCustomKey } from "@/shared/utils/apiKey";
+import { maskApiKey, toMaskedApiKeyRecord } from "@/shared/utils/maskApiKey.js";
+import { MAX_BULK_IMPORT_ITEMS } from "@/lib/oauth/bulkImport";
 
 export const dynamic = "force-dynamic";
 
@@ -18,7 +20,7 @@ export async function GET() {
       for (const key of keys) {
         const quota = quotas[key.id] || null;
         key.quota = quota;
-        key.quotaUsed = quota ? await getKeyUsageInWindow(key.key, quota.windowHours) : 0;
+        key.quotaUsed = quota ? await getKeyUsageInWindow(key.key, quota.windowHours, quota.resetAt, quota.absolute) : 0;
         // R2 quota-pressure: deduped in recordQuotaPressure, and cleared
         // (re-arming) when usage drops below 90% — fire-and-forget.
         if (quota && Number(quota.limit) > 0) {
@@ -34,7 +36,14 @@ export async function GET() {
         };
       }
     } catch {}
-    return NextResponse.json({ keys });
+    // NOTE (audit item 3): usageHistory rows are keyed by the PLAINTEXT
+    // presented key, while apiKeys.key is now a hash — so for a hashed
+    // row getKeyUsageInWindow(storedHash) matches nothing and quotaUsed /
+    // tpmUsed read 0 in this list response. Quota ENFORCEMENT is unaffected
+    // (admission passes the presented raw key). Per-key usage display for
+    // hashed keys needs usage attribution by key id/hash — follow-up work,
+    // not a silent change: do not "fix" this by echoing plaintext here.
+    return NextResponse.json({ keys: keys.map(toMaskedApiKeyRecord) });
   } catch (error) {
     console.log("Error fetching keys:", error);
     return NextResponse.json({ error: "Failed to fetch keys" }, { status: 500 });
@@ -84,8 +93,12 @@ export async function POST(request) {
     const machineId = await getConsistentMachineId();
     const apiKey = await createApiKey(trimmedName, machineId, customValue ? { customKey: customValue } : { prefix: keyPrefix });
 
+    // Audit item 3: `key` below is the ONE-TIME plaintext from creation
+    // (createApiKey stores only its hash). This 201 is the only response
+    // that ever carries a full key value; every read returns keyMasked.
     return NextResponse.json({
       key: apiKey.key,
+      keyMasked: maskApiKey(apiKey.key),
       name: apiKey.name,
       id: apiKey.id,
       machineId: apiKey.machineId,
@@ -117,6 +130,15 @@ export async function PATCH(request) {
     if (!ids.length || !updates) {
       return NextResponse.json({ error: "ids[] and updates are required" }, { status: 400 });
     }
+    // M-1: cap the batch like the bulk imports (50/request). Each id is
+    // several DB reads/writes, so an uncapped batch holds the server in a
+    // long sequential loop.
+    if (ids.length > MAX_BULK_IMPORT_ITEMS) {
+      return NextResponse.json(
+        { error: `Bulk edit is limited to ${MAX_BULK_IMPORT_ITEMS} keys per request` },
+        { status: 400 }
+      );
+    }
     if (updates.expiresAt !== undefined && updates.expiresAt !== null && !Number.isFinite(new Date(updates.expiresAt).getTime())) {
       return NextResponse.json({ error: "expiresAt must be an ISO date or null" }, { status: 400 });
     }
@@ -140,6 +162,12 @@ export async function PATCH(request) {
       }
       if (updates.quota.windowHours !== undefined && updates.quota.windowHours !== null && !Number.isFinite(Number(updates.quota.windowHours))) {
         return NextResponse.json({ error: "Bulk quota window must be a number" }, { status: 400 });
+      }
+      if (updates.quota.absolute !== undefined && updates.quota.absolute !== null && typeof updates.quota.absolute !== "boolean") {
+        return NextResponse.json({ error: "Bulk quota absolute must be a boolean" }, { status: 400 });
+      }
+      if (updates.quota.resetAt !== undefined && updates.quota.resetAt !== null && !Number.isFinite(new Date(updates.quota.resetAt).getTime())) {
+        return NextResponse.json({ error: "Bulk quota resetAt must be an ISO date or null" }, { status: 400 });
       }
     }
     if (updates.limits && typeof updates.limits === "object") {

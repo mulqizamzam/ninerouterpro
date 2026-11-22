@@ -62,6 +62,18 @@ export async function GET(request) {
           if (typeof routed === "string" && routed) resolvedModel = routed;
         }
       } catch { /* fail-open: preview with the raw input */ }
+      // Combo prompt (issue #2): when the previewed model names a combo,
+      // its prompt joins the stack exactly as a live request would see it.
+      // Bare variant names and provider/model ids never match a combo.
+      let comboPrompt = null;
+      let comboName = null;
+      if (model && !model.includes("/")) {
+        const combo = await getComboByName(model).catch(() => null);
+        if (combo?.prompt) {
+          comboPrompt = combo.prompt;
+          comboName = combo.name;
+        }
+      }
       const stack = selectPromptInjections(
         { global, byKey: userPrompts, byModel: prompts, byKeyModel: keyModelPrompts, byVariant: variants },
         {
@@ -69,6 +81,8 @@ export async function GET(request) {
           requestedModel: model,
           resolvedModel,
           bareModel: model.includes("/") ? model.slice(model.lastIndexOf("/") + 1) : model,
+          comboPrompt,
+          comboName,
         }
       );
       return NextResponse.json({ stack });
@@ -126,11 +140,22 @@ export async function PUT(request) {
           { status: 400 }
         );
       }
-      if (typeof v.model !== "string" || !v.model.includes("/")) {
+      // PATCH-ABCE (C): a backing may be a combo name (no "/") as well as
+      // a provider/model. A bare name must name an existing combo.
+      if (typeof v.model !== "string" || !v.model.trim()) {
         return NextResponse.json(
-          { error: "Variant needs a backing provider/model (e.g. dahl/deepseek-ai/DeepSeek-V4-Flash-0731)" },
+          { error: "Variant needs a backing provider/model (e.g. dahl/deepseek-ai/DeepSeek-V4-Flash-0731) or a combo name" },
           { status: 400 }
         );
+      }
+      if (!v.model.includes("/")) {
+        const combo = await getComboByName(v.model.trim()).catch(() => null);
+        if (!combo) {
+          return NextResponse.json(
+            { error: `No combo named "${v.model.trim()}" — pick a provider/model or an existing combo` },
+            { status: 400 }
+          );
+        }
       }
       const existing = (await getInjectVariants())[name];
       if (!existing && (await getComboByName(name).catch(() => null))) {

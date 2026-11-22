@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useEffect, useRef, useCallback } from "react";
+import { errorText } from "@/shared/utils/errorText";
 import Link from "next/link";
 import PropTypes from "prop-types";
 import { Card, Button, Input, Modal, CardSkeleton, Toggle, ConfirmModal, ModelSelectModal, Tooltip } from "@/shared/components";
@@ -14,6 +15,7 @@ import {
   CLIENT_PING_FAST_MS,
 } from "./endpointConstants";
 import { clientPingUrl, clientPingAny } from "./endpointPing";
+import { FREE_PROVIDERS } from "@/shared/constants/providers";
 import useSettingsStore from "@/store/settingsStore";
 import { useNotificationStore } from "@/store/notificationStore";
 import EndpointRow from "./components/EndpointRow";
@@ -420,7 +422,7 @@ export default function APIPageClient({ machineId }) {
       polling = false;
       const data = await res.json();
       if (!res.ok) {
-        setTunnelStatus({ type: "error", message: data.error || "Failed to enable tunnel" });
+        setTunnelStatus({ type: "error", message: errorText(data, "Failed to enable tunnel") });
         return;
       }
 
@@ -454,7 +456,7 @@ export default function APIPageClient({ machineId }) {
         setShowDisableTunnelModal(false);
         setTunnelStatus({ type: "success", message: "Tunnel disabled" });
       } else {
-        setTunnelStatus({ type: "error", message: data.error || "Failed to disable tunnel" });
+        setTunnelStatus({ type: "error", message: errorText(data, "Failed to disable tunnel") });
       }
     } catch (error) {
       setTunnelStatus({ type: "error", message: error.message });
@@ -616,7 +618,7 @@ export default function APIPageClient({ machineId }) {
         return;
       }
 
-      setTsStatus({ type: "error", message: data.error || "Failed to connect" });
+      setTsStatus({ type: "error", message: errorText(data, "Failed to connect") });
     } catch (error) {
       setTsStatus({ type: "error", message: error.message });
     } finally {
@@ -646,7 +648,7 @@ export default function APIPageClient({ machineId }) {
         if (data.funnelNotEnabled) continue;
         if (data.error) {
           clearUserAuth();
-          setTsStatus({ type: "error", message: data.error });
+          setTsStatus({ type: "error", message: errorText(data, "Failed to check Tailscale status") });
           return;
         }
       } catch { /* retry */ }
@@ -667,7 +669,7 @@ export default function APIPageClient({ machineId }) {
         setShowDisableTsModal(false);
         setTsStatus({ type: "success", message: "Tailscale disabled" });
       } else {
-        setTsStatus({ type: "error", message: data.error || "Failed to disable Tailscale" });
+        setTsStatus({ type: "error", message: errorText(data, "Failed to disable Tailscale") });
       }
     } catch (e) {
       setTsStatus({ type: "error", message: e.message });
@@ -1030,6 +1032,42 @@ export default function APIPageClient({ machineId }) {
 
   const [baseUrl, setBaseUrl] = useState("/v1");
 
+  // First-request model: the first no-auth free model the server actually
+  // lists, so the snippet never names a dead id. Prefixes come from the
+  // registry (a provider publishes under its UI alias — opencode lists as
+  // oc/*), hidden lanes excluded. Falls back to the static OpenCode
+  // free-lane id when /v1/models is unreachable.
+  const [firstFreeModel, setFirstFreeModel] = useState("opencode/muse-spark-1.3-contributor-free");
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const prefixes = new Set();
+        for (const p of Object.values(FREE_PROVIDERS || {})) {
+          if (!p?.noAuth || p.hidden) continue;
+          if (p.alias) prefixes.add(`${p.alias}/`);
+          if (p.id) prefixes.add(`${p.id}/`);
+        }
+        const res = await fetch("/v1/models", { cache: "no-store" });
+        const data = await res.json().catch(() => ({}));
+        const ids = Array.isArray(data?.data) ? data.data.map((m) => m?.id).filter(Boolean) : [];
+        const free = ids.find((id) => typeof id === "string" && [...prefixes].some((pre) => id.startsWith(pre)));
+        if (!cancelled && free) setFirstFreeModel(free);
+      } catch { /* keep the static fallback */ }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  const apiOrigin = baseUrl.startsWith("http") ? baseUrl.replace(/\/v1$/, "") : "";
+
+  const firstRequestSnippet = (key) => [
+    `curl ${apiOrigin}/v1/chat/completions \\`,
+    `  -H "Content-Type: application/json" \\`,
+    `  -H "Authorization: Bearer ${key}" \\`,
+    `  -d '{"model": "${firstFreeModel}", "messages": [{"role": "user", "content": "Hello!"}]}'`,
+  ].join("\n");
+
   // Hydration fix: Only access window on client side
   useEffect(() => {
     if (typeof window !== "undefined") {
@@ -1295,6 +1333,34 @@ export default function APIPageClient({ machineId }) {
             </div>
           </div>
         )}
+      </Card>
+
+      {/* Try your first request */}
+      <Card>
+        <h2 className="text-lg font-semibold mb-2 flex items-center gap-2">
+          <span className="material-symbols-outlined text-primary">play_arrow</span>
+          Try your first request
+        </h2>
+        <p className="text-sm text-text-muted mb-4">
+          No provider setup needed — this uses the free lane, which works with just an API key.
+          Replace <code className="font-mono bg-sidebar px-1 rounded">YOUR_API_KEY</code> with your key.
+          You can also use the <code className="font-mono bg-sidebar px-1 rounded">free</code> combo as the model.
+        </p>
+        {apiOrigin ? (
+          <div className="flex flex-col gap-2">
+            <pre className="overflow-x-auto rounded-lg bg-sidebar p-3 font-mono text-xs leading-5 text-text-main whitespace-pre">{firstRequestSnippet("YOUR_API_KEY")}</pre>
+            <div className="flex justify-end">
+              <Button
+                variant="secondary"
+                size="sm"
+                icon={copied === "first_request" ? "check" : "content_copy"}
+                onClick={() => copy(firstRequestSnippet("YOUR_API_KEY"), "first_request")}
+              >
+                {copied === "first_request" ? "Copied!" : "Copy"}
+              </Button>
+            </div>
+          </div>
+        ) : null}
       </Card>
 
       {/* API Keys */}
@@ -1788,7 +1854,7 @@ export default function APIPageClient({ machineId }) {
               Save this key now!
             </p>
             <p className="text-sm text-yellow-700 dark:text-yellow-300">
-              Store this key securely. You can view or copy it later from the API Keys list.
+              This is the only time you will see this key. Store it securely.
             </p>
           </div>
           <div className="flex gap-2">
@@ -1805,6 +1871,22 @@ export default function APIPageClient({ machineId }) {
               {copied === "created_key" ? "Copied!" : "Copy"}
             </Button>
           </div>
+          {apiOrigin ? (
+            <div>
+              <p className="text-sm font-medium mb-1.5">Try your first request</p>
+              <pre className="overflow-x-auto rounded-lg bg-sidebar p-3 font-mono text-xs leading-5 text-text-main whitespace-pre">{firstRequestSnippet(createdKey)}</pre>
+              <div className="flex justify-end mt-2">
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  icon={copied === "first_request_created" ? "check" : "content_copy"}
+                  onClick={() => copy(firstRequestSnippet(createdKey), "first_request_created")}
+                >
+                  {copied === "first_request_created" ? "Copied!" : "Copy"}
+                </Button>
+              </div>
+            </div>
+          ) : null}
           <Button onClick={() => { setCreatedKey(null); setCreatedKeyName(""); setCreatedKeyKind("created"); }} fullWidth>
             Done
           </Button>
