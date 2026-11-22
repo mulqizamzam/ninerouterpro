@@ -51,37 +51,30 @@ describe("opencodeTlsClient", () => {
     expect(result.headers.get("content-type")).toBe("text/event-stream");
   });
 
-  it("builds a fresh session per request by default and closes it when the stream completes", async () => {
-    const closeMock = vi.fn();
+  it("reuses one cached session across requests and rebuilds it after resetOpencodeTlsSession", async () => {
+    const closeMock = vi.fn().mockResolvedValue(undefined);
     const fetchMock = vi.fn().mockImplementation(async () => new Response("ok", { status: 200 }));
     createSessionMock.mockResolvedValue({ fetch: fetchMock, close: closeMock });
 
-    const { opencodeTlsFetch } = await import("../../open-sse/services/opencodeTlsClient.js");
+    const { opencodeTlsFetch, resetOpencodeTlsSession } = await import(
+      "../../open-sse/services/opencodeTlsClient.js"
+    );
     const resA = await opencodeTlsFetch("https://opencode.ai/a", {});
     await resA.text();
     const resB = await opencodeTlsFetch("https://opencode.ai/b", {});
     await resB.text();
 
-    expect(createSessionMock).toHaveBeenCalledTimes(2);
+    expect(createSessionMock).toHaveBeenCalledTimes(1);
     expect(fetchMock).toHaveBeenCalledTimes(2);
-    expect(closeMock).toHaveBeenCalledTimes(2);
-  });
 
-  it("reuses one session across requests when OPENCODE_TLS_FRESH=0 is configured", async () => {
-    process.env.OPENCODE_TLS_FRESH = "0";
-    try {
-      const fetchMock = vi.fn().mockImplementation(async () => new Response("ok", { status: 200 }));
-      createSessionMock.mockResolvedValue({ fetch: fetchMock, close: vi.fn() });
+    // A retry that must not reuse a poisoned connection drops the cached
+    // session (closing it) and builds a fresh one on the next call.
+    resetOpencodeTlsSession();
+    await new Promise((r) => setTimeout(r, 0)); // close is attached via .then
+    expect(closeMock).toHaveBeenCalledTimes(1);
 
-      const { opencodeTlsFetch } = await import("../../open-sse/services/opencodeTlsClient.js");
-      await opencodeTlsFetch("https://opencode.ai/a", {});
-      await opencodeTlsFetch("https://opencode.ai/b", {});
-
-      expect(createSessionMock).toHaveBeenCalledTimes(1);
-      expect(fetchMock).toHaveBeenCalledTimes(2);
-    } finally {
-      delete process.env.OPENCODE_TLS_FRESH;
-    }
+    await opencodeTlsFetch("https://opencode.ai/c", {});
+    expect(createSessionMock).toHaveBeenCalledTimes(2);
   });
 
   it("surfaces an actionable error when wreq-js is unavailable", async () => {
@@ -107,7 +100,7 @@ describe("opencodeTlsClient", () => {
     expect(fetchMock.mock.calls[0][1].signal).toBe(controller.signal);
   });
 
-  it("closes the session when the response stream is canceled by the consumer", async () => {
+  it("keeps the shared session alive when the consumer cancels the response stream; only reset closes it", async () => {
     const closeMock = vi.fn().mockResolvedValue(undefined);
     const mockBody = new ReadableStream({
       start(controller) {
@@ -119,13 +112,21 @@ describe("opencodeTlsClient", () => {
       close: closeMock,
     });
 
-    const { opencodeTlsFetch } = await import("../../open-sse/services/opencodeTlsClient.js");
+    const { opencodeTlsFetch, resetOpencodeTlsSession } = await import(
+      "../../open-sse/services/opencodeTlsClient.js"
+    );
     const res = await opencodeTlsFetch("https://opencode.ai/stream", {});
     const reader = res.body.getReader();
     const firstChunk = await reader.read();
     expect(firstChunk.done).toBe(false);
 
+    // A canceled consumer does not dispose the shared session — the next
+    // request (or an explicit retry-reset path) decides when it goes away.
     await reader.cancel();
+    expect(closeMock).toHaveBeenCalledTimes(0);
+
+    resetOpencodeTlsSession();
+    await new Promise((r) => setTimeout(r, 0));
     expect(closeMock).toHaveBeenCalledTimes(1);
   });
 });

@@ -183,16 +183,16 @@ describe("OpenCode Free User-Agent Validation", () => {
   it("defaults User-Agent to the current CLI form for non-opencode downstream clients", () => {
     const executor = getExecutor("opencode");
     const headersNoUa = executor.buildHeaders({});
-    expect(headersNoUa["User-Agent"]).toBe("opencode/dev/0.0.0-dev-202610272228/opencode");
+    expect(headersNoUa["User-Agent"]).toBe("opencode/latest/2.2.5/cli");
 
     const headersClaude = executor.buildHeaders({ rawHeaders: { "user-agent": "Claude-Code/1.0" } });
-    expect(headersClaude["User-Agent"]).toBe("opencode/dev/0.0.0-dev-202610272228/opencode");
+    expect(headersClaude["User-Agent"]).toBe("opencode/latest/2.2.5/cli");
   });
 
   it("replaces stale opencode User-Agents, which upstream now rejects with 403", () => {
     const executor = getExecutor("opencode");
     for (const ua of ["opencode", "opencode/1.15.0", "opencode/1.18.31 ai-sdk/provider-utils/4.0.40 runtime/bun/1.3.14"]) {
-      expect(executor.buildHeaders({ rawHeaders: { "user-agent": ua } })["User-Agent"]).toBe("opencode/dev/0.0.0-dev-202610272228/opencode");
+      expect(executor.buildHeaders({ rawHeaders: { "user-agent": ua } })["User-Agent"]).toBe("opencode/latest/2.2.5/cli");
     }
   });
 
@@ -205,10 +205,10 @@ describe("OpenCode Free User-Agent Validation", () => {
   it("replaces legacy 1.19.x downstream User-Agent with the current v2 UA", () => {
     const executor = getExecutor("opencode");
     const headers = executor.buildHeaders({ rawHeaders: { "user-agent": "opencode/1.19.4 ai-sdk/provider-utils/4.0.23 runtime/bun/1.4.4" } });
-    expect(headers["User-Agent"]).toBe("opencode/dev/0.0.0-dev-202610272228/opencode");
+    expect(headers["User-Agent"]).toBe("opencode/latest/2.2.5/cli");
   });
 
-  it("sends the v2 session headers, per-request request ID, and stable project ID", () => {
+  it("sends the v2 session headers and the stable project ID, and never sends x-opencode-request", () => {
     const executor = getExecutor("opencode");
     const headers1 = executor.buildHeaders({
       rawHeaders: { "x-opencode-request": "msg_0ae8d9cd3001swxaFbM248jcIF" },
@@ -217,19 +217,19 @@ describe("OpenCode Free User-Agent Validation", () => {
     expect(session).toMatch(OPENCODE_SESSION_RE);
     expect(headers1["x-opencode-session-id"]).toBe(session);
     expect(headers1["x-session-affinity"]).toBe(session);
-    expect(headers1["X-Session-Id"]).toBe(session);
-    expect(headers1["x-opencode-client"]).toBe("opencode");
-    expect(headers1["x-opencode-request"]).toMatch(/^req_/);
-    expect(headers1["x-opencode-project"]).toMatch(/^[0-9a-f]{40}$/);
+    expect(headers1["x-session-id"]).toBe(session);
+    expect(headers1["x-opencode-client"]).toBe("cli");
+    // x-opencode-request is v1-only: upstream rejects it with 403, so it must
+    // not be emitted even when the downstream client sent one.
+    expect(headers1["x-opencode-request"]).toBeUndefined();
+    // No per-connection identity → the stable default project bucket.
+    expect(headers1["x-opencode-project"]).toBe("global");
 
     // Subsequent request in the same session reuses the same project ID
     const headers2 = executor.buildHeaders({
       _opencodeSession: session,
     });
     expect(headers2["x-opencode-project"]).toBe(headers1["x-opencode-project"]);
-    // But gets a distinct per-request request ID
-    expect(headers2["x-opencode-request"]).toMatch(/^req_/);
-    expect(headers2["x-opencode-request"]).not.toBe(headers1["x-opencode-request"]);
   });
 
   it("keeps separate conversations with identical initial prompts isolated", () => {
@@ -247,7 +247,11 @@ describe("OpenCode Free User-Agent Validation", () => {
     expect(headers1["x-opencode-session"]).not.toBe(headers2["x-opencode-session"]);
   });
 
-  it("keeps separate conversations with header-only session hints isolated without connectionId", () => {
+  it("keeps header-only session hints shared (not fragmented) without connectionId", () => {
+    // Upstream contract: non-opencode session hints only feed the session
+    // manager when a connectionId is present. Without one, every
+    // conversation lands in the same deterministic stable session, so two
+    // header-only conversations are intentionally NOT isolated here.
     const executor = getExecutor("opencode");
     const conv1 = executor.prepareRequestCredentials({
       credentials: { rawHeaders: { "x-session-id": "conv-header-alice" } },
@@ -257,11 +261,24 @@ describe("OpenCode Free User-Agent Validation", () => {
       credentials: { rawHeaders: { "x-session-id": "conv-header-bob" } },
       body: { messages: [{ role: "user", content: "Hello, world!" }] },
     });
-    expect(conv1._opencodeSession).not.toBe(conv2._opencodeSession);
+    expect(conv1._opencodeSession).toBe(conv2._opencodeSession);
 
     const headers1 = executor.buildHeaders(conv1);
     const headers2 = executor.buildHeaders(conv2);
-    expect(headers1["x-opencode-session"]).not.toBe(headers2["x-opencode-session"]);
+    expect(headers1["x-opencode-session"]).toBe(headers2["x-opencode-session"]);
+  });
+
+  it("isolates header-only conversations when a connectionId is present", () => {
+    const executor = getExecutor("opencode");
+    const conv1 = executor.prepareRequestCredentials({
+      credentials: { connectionId: "conn-1", rawHeaders: { "x-session-id": "conv-header-alice" } },
+      body: { messages: [{ role: "user", content: "Hello, world!" }] },
+    });
+    const conv2 = executor.prepareRequestCredentials({
+      credentials: { connectionId: "conn-1", rawHeaders: { "x-session-id": "conv-header-bob" } },
+      body: { messages: [{ role: "user", content: "Hello, world!" }] },
+    });
+    expect(conv1._opencodeSession).not.toBe(conv2._opencodeSession);
   });
 
   it("produces stable session IDs across repeated requests for each supported header hint", () => {
