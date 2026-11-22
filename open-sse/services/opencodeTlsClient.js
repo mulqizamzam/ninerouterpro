@@ -36,15 +36,8 @@ const OPENCODE_CIPHER_LIST = [
 ].join(":");
 
 const DEFAULT_TIMEOUT_MS = 120000;
-const DIRECT_KEY = "(direct)";
-const MAX_PROXY_SESSIONS = 64;
-const sessionCache = new Map();
 
-// Fresh-connection mode (default ON): each request builds an impersonated TLS
-// session that is closed as soon as the response stream completes or cancels.
-// This prevents connection-pooling reuse from chaining 429 rate-limit states.
-// OPENCODE_TLS_FRESH=0 restores pooled sessions per proxy.
-const FRESH_TLS = process.env.OPENCODE_TLS_FRESH !== "0" && process.env.OPENCODE_TLS_FRESH !== "false";
+let sessionPromise = null;
 
 export class OpencodeTlsUnavailableError extends Error {
   constructor(message) {
@@ -53,48 +46,29 @@ export class OpencodeTlsUnavailableError extends Error {
   }
 }
 
-async function buildSession(proxyUrl) {
-  const wreq = await loadRuntimeDep("wreq-js");
-  if (typeof wreq.createSession !== "function") {
-    throw new Error("wreq-js runtime is missing createSession");
+async function loadSession() {
+  if (!sessionPromise) {
+    sessionPromise = (async () => {
+      const wreq = await loadRuntimeDep("wreq-js");
+      if (typeof wreq.createSession !== "function") {
+        throw new Error("wreq-js runtime is missing createSession");
+      }
+      return wreq.createSession({
+        emulation: { tlsOptions: { cipherList: OPENCODE_CIPHER_LIST } },
+      });
+    })().catch((error) => {
+      sessionPromise = null;
+      throw error;
+    });
   }
-  const options = {
-    emulation: { tlsOptions: { cipherList: OPENCODE_CIPHER_LIST } },
-  };
-  if (proxyUrl && proxyUrl !== DIRECT_KEY) {
-    options.proxy = proxyUrl;
-  }
-  return wreq.createSession(options);
+  return sessionPromise;
 }
 
-function getSession(proxyUrl) {
-  const key = proxyUrl || DIRECT_KEY;
-  const cached = sessionCache.get(key);
-  if (cached) {
-    sessionCache.delete(key);
-    sessionCache.set(key, cached);
-    return cached;
-  }
-  const p = buildSession(proxyUrl).catch((err) => {
-    sessionCache.delete(key);
-    throw err;
-  });
-  sessionCache.set(key, p);
-  if (sessionCache.size > MAX_PROXY_SESSIONS) {
-    const oldestKey = sessionCache.keys().next().value;
-    const oldest = sessionCache.get(oldestKey);
-    sessionCache.delete(oldestKey);
-    oldest?.then((s) => s?.close?.()).catch(() => {});
-  }
-  return p;
-}
-
-/** Drop cached sessions so subsequent calls build fresh ones. */
+/** Drop the cached session so the next call builds a fresh one. */
 export function resetOpencodeTlsSession() {
-  for (const [, p] of sessionCache.entries()) {
-    p?.then((session) => session?.close?.()).catch(() => {});
-  }
-  sessionCache.clear();
+  const pending = sessionPromise;
+  sessionPromise = null;
+  pending?.then((session) => session.close?.()).catch(() => {});
 }
 
 /**
@@ -102,81 +76,33 @@ export function resetOpencodeTlsSession() {
  * downstream `.body` / `.text()` / `.json()` consumers keep working unchanged.
  *
  * Streaming is preserved: the response body is handed over as the live
- * ReadableStream, never buffered. Sockets are gracefully torn down when
- * the stream finishes or cancels.
+ * ReadableStream, never buffered.
  */
-export async function opencodeTlsFetch(url, init = {}, { signal, timeoutMs = DEFAULT_TIMEOUT_MS, proxyUrl } = {}) {
+export async function opencodeTlsFetch(url, init = {}, { signal, timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
   let session;
   try {
-    session = FRESH_TLS ? await buildSession(proxyUrl) : await getSession(proxyUrl);
+    session = await loadSession();
   } catch (error) {
     throw new OpencodeTlsUnavailableError(
       `wreq-js unavailable (${error instanceof Error ? error.message : "unknown"}) — install the optional wreq-js dependency to reach the OpenCode free tier`
     );
   }
 
-  const closeSession = () => {
-    try {
-      const p = session?.close?.();
-      if (p && typeof p.catch === "function") p.catch(() => {});
-    } catch {}
-  };
-
   const options = {
     method: init.method || "GET",
-    headers: {
-      ...init.headers,
-      "Connection": "close",
-    },
+    headers: init.headers,
     redirect: "follow",
     timeout: timeoutMs,
   };
   if (init.body !== undefined) options.body = init.body;
   if (signal) options.signal = signal;
 
-  let res;
-  try {
-    res = await session.fetch(url, options);
-  } catch (err) {
-    if (FRESH_TLS) closeSession();
-    throw err;
-  }
-
+  const res = await session.fetch(url, options);
   const headers = {};
   res.headers?.forEach?.((value, key) => {
     headers[key] = value;
   });
-
-  let body = res.body;
-  if (FRESH_TLS) {
-    if (body && typeof body.getReader === "function") {
-      const reader = body.getReader();
-      body = new ReadableStream({
-        async pull(controller) {
-          try {
-            const { done, value } = await reader.read();
-            if (done) {
-              closeSession();
-              controller.close();
-            } else {
-              controller.enqueue(value);
-            }
-          } catch (err) {
-            closeSession();
-            controller.error(err);
-          }
-        },
-        async cancel(reason) {
-          closeSession();
-          try { await reader.cancel(reason); } catch {}
-        }
-      });
-    } else {
-      closeSession();
-    }
-  }
-
-  return new Response(body, { status: res.status, statusText: res.statusText, headers });
+  return new Response(res.body, { status: res.status, statusText: res.statusText, headers });
 }
 
 export const __test__ = { OPENCODE_CIPHER_LIST };

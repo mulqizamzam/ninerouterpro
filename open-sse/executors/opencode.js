@@ -16,22 +16,14 @@ import {
   coerceResponsesOutput,
 } from "../translator/formats/responsesApi.js";
 
-// OpenCode v2 UA shape: opencode/<channel>/<version>/<client>. Upstream rejects
-// legacy shapes and requires wire parity with the current released v2 CLI.
-const OPENCODE_UA = "opencode/dev/0.0.0-dev-202610272228/opencode";
-const OPENCODE_CLIENT = "opencode";
-const BOOT_PROJECT_ID = crypto.randomBytes(20).toString("hex");
-
-// 40-hex project id generator: mirrors the real CLI which derives it
-// from the local workspace path, ensuring router instances and connections
-// maintain a stable project identity without colliding into a single "global" bucket.
-export function generateProjectId(credentials) {
-  const ws = credentials?.workspaceId || credentials?.connectionId;
-  if (ws) {
-    return crypto.createHash("sha1").update(`project:${ws}`).digest("hex");
-  }
-  return BOOT_PROJECT_ID;
-}
+// Shape as of the 1.19.x CLI (reverse-engineered 2026-10-23 via mitmproxy):
+// "opencode/<version> ai-sdk/provider-utils/<v> runtime/bun/<v>" with
+// x-opencode-client: cli, x-opencode-project, and a per-message
+// x-opencode-request: msg_<...>. The executor must keep mirroring whatever
+// the current CLI sends: a stale UA is how the free tier tells a relay apart
+// from the real client (upstream #5107).
+const OPENCODE_UA = "opencode/1.19.4 ai-sdk/provider-utils/4.0.23 runtime/bun/1.4.4";
+const OPENCODE_CLIENT = "cli";
 const MAX_SESSION_LENGTH = 256;
 const MAX_TOOL_NAME_LEN = 128;
 const SESSION_HEADER = "x-opencode-session";
@@ -40,8 +32,13 @@ export const OPENCODE_SESSION_RE = /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/;
 const BASE62_CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
 function hasValidOpencodeVersion(ua) {
-  const m = String(ua || "").match(/^opencode\/[a-z0-9-]+\/(\d+)\.\d+\.\d+\/[a-z0-9-]+$/i);
-  return !!m && parseInt(m[1], 10) >= 2;
+  // Only the real current CLI shape passes through: the v2 channel shape
+  // ("opencode/<channel>/<major>.<minor>.<patch>/<client>") was the previous
+  // generation and now reads as a stale relay UA, so anything that is not the
+  // current "opencode/<version> ai-sdk/provider-utils/<v> runtime/bun/<v>"
+  // form is replaced with the current UA. Anything else (curl, python, a
+  // pinned UA) is not the CLI.
+  return /^opencode\/\d+\.\d+\.\d+ ai-sdk\/provider-utils\/[\d.]+ runtime\/bun\/[\d.]+$/i.test(String(ua || ""));
 }
 // Models served by /inference/v1/responses; every other model stays on /chat/completions.
 const RESPONSES_MODELS = new Set([
@@ -82,8 +79,21 @@ export function generateSessionId(timestamp = Date.now()) {
   return `ses_${descendingTimeHex(timestamp, counter)}${unstableRandom()}`;
 }
 
-export function generateRequestId() {
-  return "req_" + crypto.randomBytes(12).toString("hex");
+// Request ids use the same timestamp scheme as the CLI, ascending (no bitwise
+// NOT): msg_<48-bit timestamp+counter hex><14 base62 chars>.
+export function generateRequestId(timestamp = Date.now()) {
+  if (timestamp !== lastTimestamp) {
+    lastTimestamp = timestamp;
+    counter = 0;
+  }
+  counter++;
+  const value = BigInt(timestamp) * 0x1000n + BigInt(counter);
+  const time = Array.from({ length: 6 }, (_, index) =>
+    Number((value >> BigInt(40 - 8 * index)) & 0xffn)
+      .toString(16)
+      .padStart(2, "0")
+  ).join("");
+  return `msg_${time}${unstableRandom()}`;
 }
 
 // Upstream decodes the prefix timestamp and refuses sessions whose time is in
@@ -221,23 +231,6 @@ function bodyHasSessionHints(body) {
   }
 }
 
-const RECOGNIZED_SESSION_HEADERS = [
-  "x-session-id",
-  "session-id",
-  "session_id",
-  "x-amp-thread-id",
-  "x-claude-code-session-id",
-  "x-conversation-id",
-];
-
-function headersHaveSessionHints(headers) {
-  if (!headers || typeof headers !== "object") return false;
-  for (const k of Object.keys(headers)) {
-    if (RECOGNIZED_SESSION_HEADERS.includes(k.toLowerCase()) && headers[k]) return true;
-  }
-  return false;
-}
-
 // Strip the thinking suffix "model(level)" so registry lookups hit the base id.
 function baseModelId(model) {
   return String(model || "").replace(/\([^()]+\)\s*$/, "").trim();
@@ -268,28 +261,11 @@ function resolveOpencodeSession(body, credentials, providerSessionId, clientTool
   const hinted = incoming || normalizeSession(providerSessionId);
   if (hinted) return translateSessionId(hinted, clientTool);
 
-  let explicitClient = body?.prompt_cache_key || body?.session_id || body?.conversation_id;
-  if (!explicitClient) {
-    for (const [k, v] of Object.entries(headers)) {
-      if (k.toLowerCase() === "x-conversation-id" && v) {
-        explicitClient = v;
-        break;
-      }
-    }
-  }
-  if (explicitClient) {
-    return translateSessionId(String(explicitClient), clientTool);
-  }
-
-  if (credentials?.connectionId || bodyHasSessionHints(body) || headersHaveSessionHints(headers)) {
+  if (credentials?.connectionId || bodyHasSessionHints(body)) {
     let viaManager = null;
     try {
-      const sanitizedHeaders = {};
-      for (const [k, v] of Object.entries(headers)) {
-        if (k.toLowerCase() !== "x-client-request-id") sanitizedHeaders[k] = v;
-      }
       viaManager = resolveSessionId({
-        headers: sanitizedHeaders,
+        headers,
         body,
         connectionId: credentials?.connectionId,
         scope: "opencode",
@@ -451,9 +427,6 @@ export class OpenCodeExecutor extends BaseExecutor {
       dropAdaptiveReasoningEffort(body);
       applyFingerprintTools(body, false, { claude: isMessagesModel(model || body?.model) });
     }
-    if (body && typeof body === "object" && credentials?.[SESSION_FIELD]) {
-      body.prompt_cache_key = credentials[SESSION_FIELD];
-    }
     return injectReasoningContent({ provider: this.provider, model, body });
   }
 
@@ -469,51 +442,32 @@ export class OpenCodeExecutor extends BaseExecutor {
   // the free lane.
   async execute(args) {
     const credentials = this.prepareRequestCredentials(args);
-    let providerOverrides = args?.providerOverrides;
-    if (providerOverrides?.headers) {
-      const sanitized = {};
-      for (const [k, v] of Object.entries(providerOverrides.headers)) {
-        if (k.toLowerCase() !== "x-opencode-request") {
-          sanitized[k] = v;
-        }
-      }
-      providerOverrides = { ...providerOverrides, headers: sanitized };
-    }
     return super.execute({
       ...args,
-      providerOverrides,
       credentials,
-      // Pro divergence kept: fail open to native fetch when wreq-js is missing.
-      directFetch: async (url, options, extra = {}) => {
-        const headers = {
-          ...(options?.headers || {}),
-          "x-opencode-request": generateRequestId(),
-        };
+      directFetch: async (url, options) => {
         try {
           return await opencodeTlsFetch(url, {
             method: options.method,
-            headers,
+            headers: options.headers,
             body: options.body,
-          }, {
-            signal: options.signal,
-            proxyUrl: extra.proxyUrl || options.proxyUrl,
-          });
+          }, { signal: options.signal });
         } catch (err) {
           if (err?.name !== "OpencodeTlsUnavailableError") throw err;
-          return fetch(url, { ...options, headers });
+          return fetch(url, options);
         }
       },
-      directFetchProxy: true,
     });
   }
 
-  // Free tier moved from /zen/v1 to /inference/v1 (OpenCode v2); /zen/v1 now
-  // answers every free request with 403 FreeTierError.
+  // Free tier endpoints matching OpenCode 1.19+ CLI:
+  // OpenAI chat format routes to /inference/openai/v1/chat/completions,
+  // Anthropic messages format routes to /inference/anthropic/v1/messages.
   buildUrl(model) {
     const base = this.config.baseUrl;
     if (isResponsesModel(model)) return `${base}/inference/v1/responses`;
-    if (isMessagesModel(model)) return `${base}/inference/v1/messages`;
-    return `${base}/inference/v1/chat/completions`;
+    if (isMessagesModel(model)) return `${base}/inference/anthropic/v1/messages`;
+    return `${base}/inference/openai/v1/chat/completions`;
   }
 
   buildHeaders(credentials, stream = true, url = "") {
@@ -526,23 +480,18 @@ export class OpenCodeExecutor extends BaseExecutor {
 
     const session = credentials?.[SESSION_FIELD] || this.prepareRequestCredentials({ credentials })[SESSION_FIELD];
 
-    const projectHeader = lower["x-opencode-project"];
-    const validProject = typeof projectHeader === "string" && /^[0-9a-f]{40}$/i.test(projectHeader);
-
-    // Mirrors the real v2 CLI wire shape: session id is sent on all four headers
-    // (session, session-id, session-affinity, X-Session-Id), x-opencode-request
-    // is freshly generated per request, and project id has stable 40-hex workspace identity.
+    // Mirrors the current CLI (OpenCode 1.19.4). The official client sends
+    // x-opencode-request alongside x-opencode-session / session-id, and omits
+    // x-session-affinity and x-session-id (which are only for non-opencode providers).
     const headers = {
       "Content-Type": "application/json",
       "Authorization": "Bearer public",
       "User-Agent": isOpencodeDownstream ? downstreamUa : OPENCODE_UA,
       "x-opencode-client": lower["x-opencode-client"] || OPENCODE_CLIENT,
-      "x-opencode-project": validProject ? projectHeader.toLowerCase() : generateProjectId(credentials),
-      "x-opencode-request": generateRequestId(),
       "x-opencode-session": session,
       "x-opencode-session-id": session,
-      "x-session-affinity": session,
-      "X-Session-Id": session,
+      "x-opencode-request": generateRequestId(),
+      "x-opencode-project": lower["x-opencode-project"] || "global",
       "Accept": stream ? "text/event-stream" : "*/*",
     };
     if (url.endsWith("/messages")) headers["anthropic-version"] = ANTHROPIC_API_VERSION;
